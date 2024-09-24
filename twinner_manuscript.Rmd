@@ -1,0 +1,1840 @@
+---
+title: "Twinner analysis to identify features distinguishing macrophage groups"
+author: "Tiago M. Costa"
+date: "January, 2024"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+  pdf_document:
+    number_sections: yes"N"
+    toc: yes
+---
+
+```{r libraries, include=FALSE}
+suppressMessages(library(Seurat))
+suppressMessages(library(dplyr))
+suppressMessages(library(propagate))
+suppressMessages(library(lsa))
+suppressMessages(library(glmnet))
+suppressMessages(library(VennDiagram))
+suppressMessages(library(readxl))
+suppressMessages(library(tidyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(hrbrthemes))
+suppressMessages(library(CellChat))
+suppressMessages(library(caret))
+suppressMessages(library(Metrics))
+suppressMessages(library(pROC))
+suppressMessages(library(e1071))
+suppressMessages(library(ROCR))
+
+suppressMessages(library(randomForest))
+suppressMessages(library(caret))
+suppressMessages(library(precrec))
+```
+
+```{r}
+def_pos_mat <- function(num) {
+  A <- matrix(runif(num^2)*2-1, ncol=num) 
+  return (t(A) %*% A)
+}
+
+draw_confusion_matrix <- function(cm) {
+
+  #layout(matrix(c(1,1,2)))
+  par(mar=c(2,2,2,2))
+  plot(c(100, 345), c(300, 450), type = "n", xlab="", ylab="", xaxt='n', yaxt='n')
+
+  # create the matrix 
+  rect(150, 430, 240, 370, col='#3F97D0')
+  text(195, 435, 'i', cex=3)
+  rect(250, 430, 340, 370, col='#F7AD50')
+  text(295, 435, 'ii', cex=3)
+  text(125, 370, 'Predicted', cex=3, srt=90, font=2)
+  text(245, 450, 'Actual', cex=3, font=2)
+  rect(150, 305, 240, 365, col='#F7AD50')
+  rect(250, 305, 340, 365, col='#3F97D0')
+  text(140, 400, 'i', cex=3, srt=90)
+  text(140, 335, 'ii', cex=3, srt=90)
+
+  # add in the cm results 
+  res <- as.numeric(cm$table)
+  text(195, 400, res[1], cex=4, font=2, col='white')
+  text(195, 335, res[2], cex=4, font=2, col='white')
+  text(295, 400, res[3], cex=4, font=2, col='white')
+  text(295, 335, res[4], cex=4, font=2, col='white')
+
+  # # add in the specifics 
+  # plot(c(100, 0), c(100, 0), type = "n", xlab="", ylab="", main = "DETAILS", xaxt='n', yaxt='n')
+  # text(10, 85, names(cm$byClass[1]), cex=1.2, font=2)
+  # text(10, 70, round(as.numeric(cm$byClass[1]), 3), cex=1.2)
+  # text(30, 85, names(cm$byClass[2]), cex=1.2, font=2)
+  # text(30, 70, round(as.numeric(cm$byClass[2]), 3), cex=1.2)
+  # text(50, 85, names(cm$byClass[5]), cex=1.2, font=2)
+  # text(50, 70, round(as.numeric(cm$byClass[5]), 3), cex=1.2)
+  # text(70, 85, names(cm$byClass[6]), cex=1.2, font=2)
+  # text(70, 70, round(as.numeric(cm$byClass[6]), 3), cex=1.2)
+  # text(90, 85, names(cm$byClass[7]), cex=1.2, font=2)
+  # text(90, 70, round(as.numeric(cm$byClass[7]), 3), cex=1.2)
+  # 
+  # # add in the accuracy information 
+  # text(30, 35, names(cm$overall[1]), cex=1.5, font=2)
+  # text(30, 20, round(as.numeric(cm$overall[1]), 3), cex=1.4)
+  # text(70, 35, names(cm$overall[2]), cex=1.5, font=2)
+  # text(70, 20, round(as.numeric(cm$overall[2]), 3), cex=1.4)
+}  
+```
+
+# Figure 1: Synthetic data test
+
+```{r create synthetic data, include=FALSE}
+# https://www.r-bloggers.com/2016/02/generating-and-visualizing-multivariate-data-with-r/
+
+library(MASS)
+set.seed(123)
+n_feats <- 100
+
+# Mean
+mu_a_yg <- runif(n = n_feats, min = 1, max = 50)
+mu_b_yg <- mu_a_yg/3
+mu_c_yg <- rnorm(n = n_feats)
+
+mu_a_old <- runif(n = n_feats, min = 1, max = 50)
+mu_b_old <- mu_a_old/2
+mu_c_old <- rnorm(n = n_feats)
+# Covariance matrix
+sigma_a_yg <- def_pos_mat(n_feats)  
+sigma_b_yg <- sigma_a_yg/3  
+sigma_c_yg <- def_pos_mat(n_feats)   
+
+sigma_a_old <- def_pos_mat(n_feats)
+sigma_b_old <- sigma_a_old/2
+sigma_c_old <- def_pos_mat(n_feats)  
+
+# Generate sample from N(mu, Sigma)
+bivn_a_yg <- mvrnorm(2000, mu = mu_a_yg, Sigma = sigma_a_yg )
+bivn_b_yg <- mvrnorm(1000, mu = mu_b_yg, Sigma = sigma_b_yg )
+bivn_c_yg <- mvrnorm(2000, mu = mu_c_yg, Sigma = sigma_c_yg )
+
+bivn_a_old <- mvrnorm(1500, mu = mu_a_old, Sigma = sigma_a_old )
+bivn_b_old <- mvrnorm(2000, mu = mu_b_old, Sigma = sigma_b_old )
+bivn_c_old <- mvrnorm(1000, mu = mu_c_old, Sigma = sigma_c_old )
+
+y_a <- c(rep(0, 2000), rep(1, 1500))
+y_b <- c(rep(0, 1000), rep(1, 2000))
+y_c <- c(rep(0, 2000), rep(1, 1000))
+
+x_a <- rbind(bivn_a_yg, bivn_a_old)
+x_b <- rbind(bivn_b_yg, bivn_b_old)
+x_c <- rbind(bivn_c_yg, bivn_c_old)
+
+xdata <- scale(rbind(x_a, x_b, x_c))
+ydata <- c(y_a, y_b, y_c)
+ylabel <- c(rep("a",length(y_a)), rep("b",length(y_b)), rep("c", length(y_b)))
+
+rm(y_a, y_b, y_c, bivn_a_yg, bivn_b_yg, bivn_c_yg, bivn_a_old, 
+   bivn_b_old, bivn_c_old, sigma_a_yg, sigma_b_yg, sigma_c_yg, sigma_a_old,
+   sigma_b_old, sigma_c_old, mu_a_yg, mu_b_yg, mu_c_yg, mu_a_old, mu_b_old,
+   mu_c_old)
+
+data <- data.frame(xdata, y = ydata, label = ylabel)
+```
+
+```{r train data}
+#Define train and test data
+itrain <- sort(sample(nrow(xdata), nrow(xdata)*.9))
+```
+
+```{r building correlation matrices}
+# this part should receive an arbitrary number of matrices
+groups <- unique(data[,'label'])
+group_list <- list()
+
+for (i in 1:length(groups)) {
+  group_list[[i]] <- data[which(data[,'label'] == groups[i]),!colnames(data) %in% c("y", "label")]
+}
+
+# normalizing data
+group_list <- lapply(group_list, scale)
+
+## correlation matrices
+group_cor <- lapply(group_list, function (x) bigcor(x, y = NULL, fun = "cor", size = 2000, verbose=FALSE))
+group_cor <- lapply(group_cor, function (x) as.data.frame(as.ffdf(x)))
+```
+
+```{r feature correlation weight - mean}
+# angular distance
+group_combs <- combn(length(group_cor),2)
+ang_weight_mat = matrix(0, nrow = dim(group_combs)[2], ncol = n_feats) #nrows is the number of combinations of the dataset groups in two slots
+
+# matrix of correlation vectors here, between each combination of groups
+
+# to penalize genes with smaller distances in the correlation matrix; try 1 - norm angle
+for (i in 1:n_feats){
+  for (k in 1:dim(group_combs)[2]) {
+    ang_weight_mat[k,i] <- 1 - acos(cosine(group_cor[[group_combs[1,k]]][,i],group_cor[[group_combs[2,k]]][,i]))/pi
+  }
+}
+
+ang_weight <- apply(ang_weight_mat, 2, mean) #what measurement of central tendency should we use is an open question
+
+pdf("twiner_synthetic_feature-weight_mean.pdf", width = 9)
+data.frame(weight = ang_weight) %>%
+  ggplot(aes(x = weight)) +
+    geom_histogram( binwidth=0.01, fill="#69b3a2", color="#e9ecef", alpha=0.9) +
+    ggtitle("") +
+    theme_minimal() +
+    theme(plot.title = element_text(size=15), axis.title.x = element_text(size = 15),
+          axis.title.y.left = element_text(size = 30), axis.title.x.bottom = element_text(size = 30),
+          axis.text.x.bottom = element_text(size = 30), axis.text.y.left = element_text(size = 30)) +
+    xlim(c(0,1)) + 
+    xlab("Feature weight") + 
+    ylab("Count")
+dev.off()
+
+#Train model and save
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, "models/disTwiner_meanWeights.rds")
+```
+
+```{r evaluate classifier performance - mean}
+model_type <- "meanWeights"
+fit_EN_cv_oldyg <- readRDS(paste0("models/disTwiner_", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(ypredictions, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(ypredictions))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+
+#Distribution standard deviation
+std <- sd(ang_weight)
+saveRDS(std, paste0("model_evaluation/std/disTwiner_", model_type, "_std.rds"))
+
+# pdf("disTwiner_simulated_roc_mean.pdf")
+# cfit_test <- cv.glmnet(xdata[-itrain,], as.factor(ydata[-itrain]), family = "binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure = "auc", keep = TRUE)
+# rocs <- roc.glmnet(cfit_test$fit.preval, newy = as.factor(ydata[-itrain]))
+# best <- cfit_test$index["min",]
+# plot(rocs[[best]], type = "l")
+# invisible(sapply(rocs, lines, col="grey"))
+# lines(rocs[[best]], lwd = 2,col = "red")
+# dev.off()
+```
+
+```{r feature correlation weight - maximum}
+# angular distance
+group_combs <- combn(length(group_cor),2)
+ang_weight_mat = matrix(0, nrow = dim(group_combs)[2], ncol = n_feats) #nrows is the number of combinations of the dataset groups in two slots
+
+# matrix of correlation vectors here, between each combination of groups
+
+# to penalize genes with smaller distances in the correlation matrix; try 1 - norm angle
+for (i in 1:n_feats){
+  for (k in 1:dim(group_combs)[2]) {
+    ang_weight_mat[k,i] <- 1 - acos(cosine(group_cor[[group_combs[1,k]]][,i],group_cor[[group_combs[2,k]]][,i]))/pi
+  }
+}
+
+ang_weight <- apply(ang_weight_mat, 2, max) #what measurement of central tendency should we use is an open question
+
+pdf("twiner_synthetic_feature-weight_max.pdf", width = 9)
+data.frame(weight = ang_weight) %>%
+  ggplot(aes(x = weight)) +
+    geom_histogram( binwidth=0.01, fill="#69b3a2", color="#e9ecef", alpha=0.9) +
+    ggtitle("") +
+    theme_minimal() +
+    theme(plot.title = element_text(size=15), axis.title.x = element_text(size = 15),
+          axis.title.y.left = element_text(size = 30), axis.title.x.bottom = element_text(size = 30),
+          axis.text.x.bottom = element_text(size = 30), axis.text.y.left = element_text(size = 30)) +
+    xlim(c(0,1)) + 
+    xlab("Feature weight") + 
+    ylab("Count")
+dev.off()
+
+#Train model and save
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, "models/disTwiner_maximumWeights.rds")
+```
+
+```{r evaluate classifier performance - maximum}
+model_type <- "maximumWeights"
+fit_EN_cv_oldyg <- readRDS(paste0("models/disTwiner_", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(ypredictions, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(ypredictions))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+
+#Distribution standard deviation
+std <- sd(ang_weight)
+saveRDS(std, paste0("model_evaluation/std/disTwiner_", model_type, "_std.rds"))
+
+# pdf("disTwiner_simulated_roc_mean.pdf")
+# cfit_test <- cv.glmnet(xdata[-itrain,], as.factor(ydata[-itrain]), family = "binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure = "auc", keep = TRUE)
+# rocs <- roc.glmnet(cfit_test$fit.preval, newy = as.factor(ydata[-itrain]))
+# best <- cfit_test$index["min",]
+# plot(rocs[[best]], type = "l")
+# invisible(sapply(rocs, lines, col="grey"))
+# lines(rocs[[best]], lwd = 2,col = "red")
+# dev.off()
+```
+
+```{r feature correlation weight - minimum}
+# angular distance
+group_combs <- combn(length(group_cor),2)
+ang_weight_mat = matrix(0, nrow = dim(group_combs)[2], ncol = n_feats) #nrows is the number of combinations of the dataset groups in two slots
+
+# matrix of correlation vectors here, between each combination of groups
+
+# to penalize genes with smaller distances in the correlation matrix; try 1 - norm angle
+for (i in 1:n_feats){
+  for (k in 1:dim(group_combs)[2]) {
+    ang_weight_mat[k,i] <- 1 - acos(cosine(group_cor[[group_combs[1,k]]][,i],group_cor[[group_combs[2,k]]][,i]))/pi
+  }
+}
+
+ang_weight <- apply(ang_weight_mat, 2, min) #what measurement of central tendency should we use is an open question
+
+pdf("twiner_synthetic_feature-weight_min.pdf", width = 9)
+data.frame(weight = ang_weight) %>%
+  ggplot(aes(x = weight)) +
+    geom_histogram( binwidth=0.01, fill="#69b3a2", color="#e9ecef", alpha=0.9) +
+    ggtitle("") +
+    theme_minimal() +
+    theme(plot.title = element_text(size=15), axis.title.x = element_text(size = 15),
+          axis.title.y.left = element_text(size = 30), axis.title.x.bottom = element_text(size = 30),
+          axis.text.x.bottom = element_text(size = 30), axis.text.y.left = element_text(size = 30)) +
+    xlim(c(0,1)) + 
+    xlab("Feature weight") + 
+    ylab("Count")
+dev.off()
+
+#Train model and save
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, "models/disTwiner_minimumWeights.rds")
+```
+
+```{r evaluate classifier performance - minimum}
+model_type <- "minimumWeights"
+fit_EN_cv_oldyg <- readRDS(paste0("models/disTwiner_", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(ypredictions, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(ypredictions))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+
+#Distribution standard deviation
+std <- sd(ang_weight)
+saveRDS(std, paste0("model_evaluation/std/disTwiner_", model_type, "_std.rds"))
+
+# pdf("disTwiner_simulated_roc_mean.pdf")
+# cfit_test <- cv.glmnet(xdata[-itrain,], as.factor(ydata[-itrain]), family = "binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure = "auc", keep = TRUE)
+# rocs <- roc.glmnet(cfit_test$fit.preval, newy = as.factor(ydata[-itrain]))
+# best <- cfit_test$index["min",]
+# plot(rocs[[best]], type = "l")
+# invisible(sapply(rocs, lines, col="grey"))
+# lines(rocs[[best]], lwd = 2,col = "red")
+# dev.off()
+```
+
+```{r feature correlation weight - mean of 10% max}
+# angular distance
+group_combs <- combn(length(group_cor),2)
+ang_weight_mat = matrix(0, nrow = dim(group_combs)[2], ncol = n_feats) #nrows is the number of combinations of the dataset groups in two slots
+
+# matrix of correlation vectors here, between each combination of groups
+
+# to penalize genes with smaller distances in the correlation matrix; try 1 - norm angle
+for (i in 1:n_feats){
+  for (k in 1:dim(group_combs)[2]) {
+    ang_weight_mat[k,i] <- 1 - acos(cosine(group_cor[[group_combs[1,k]]][,i],group_cor[[group_combs[2,k]]][,i]))/pi
+  }
+}
+
+ang_weight <- apply(ang_weight_mat, 2, function(x) mean(x[which(x >= quantile(x, probs = .9, na.rm = TRUE))])) #what measurement of central tendency should we use is an open question
+
+pdf("twiner_synthetic_feature-weight_mean-of-max.pdf")
+data.frame(weight = ang_weight) %>%
+  ggplot(aes(x = weight)) +
+    geom_histogram( binwidth=0.01, fill="#69b3a2", color="#e9ecef", alpha=0.9) +
+    ggtitle("Feature correlation weights") +
+    theme_minimal() +
+    theme(plot.title = element_text(size=15), axis.title.x = element_text(size = 15),
+          axis.title.y.left = element_text(size = 30), axis.title.x.bottom = element_text(size = 30),
+          axis.text.x.bottom = element_text(size = 30), axis.text.y.left = element_text(size = 30)) +
+    xlim(c(0,1)) + 
+    xlab("Feature weight") + 
+    ylab("Count")
+dev.off()
+
+#Train model and save
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, "models/disTwiner_maximumPercentileWeights.rds")
+```
+
+```{r evaluate classifier performance - mean of 10% max}
+model_type <- "maximumPercentileWeights"
+fit_EN_cv_oldyg <- readRDS(paste0("models/disTwiner_", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(ypredictions, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(ypredictions))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+
+#Distribution standard deviation
+std <- sd(ang_weight)
+saveRDS(std, paste0("model_evaluation/std/disTwiner_", model_type, "_std.rds"))
+
+# pdf("disTwiner_simulated_roc_mean.pdf")
+# cfit_test <- cv.glmnet(xdata[-itrain,], as.factor(ydata[-itrain]), family = "binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure = "auc", keep = TRUE)
+# rocs <- roc.glmnet(cfit_test$fit.preval, newy = as.factor(ydata[-itrain]))
+# best <- cfit_test$index["min",]
+# plot(rocs[[best]], type = "l")
+# invisible(sapply(rocs, lines, col="grey"))
+# lines(rocs[[best]], lwd = 2,col = "red")
+# dev.off()
+```
+
+```{r feature correlation weight - mean of 10% min}
+# angular distance
+group_combs <- combn(length(group_cor),2)
+ang_weight_mat = matrix(0, nrow = dim(group_combs)[2], ncol = n_feats) #nrows is the number of combinations of the dataset groups in two slots
+
+# matrix of correlation vectors here, between each combination of groups
+
+# to penalize genes with smaller distances in the correlation matrix; try 1 - norm angle
+for (i in 1:n_feats){
+  for (k in 1:dim(group_combs)[2]) {
+    ang_weight_mat[k,i] <- 1 - acos(cosine(group_cor[[group_combs[1,k]]][,i],group_cor[[group_combs[2,k]]][,i]))/pi
+  }
+}
+
+ang_weight <- apply(ang_weight_mat, 2, function(x) mean(x[which(x <= quantile(x, probs = .1, na.rm = TRUE))])) #what measurement of central tendency should we use is an open question
+
+pdf("twiner_synthetic_feature-weight_mean-of-min.pdf")
+data.frame(weight = ang_weight) %>%
+  ggplot(aes(x = weight)) +
+    geom_histogram( binwidth=0.01, fill="#69b3a2", color="#e9ecef", alpha=0.9) +
+    ggtitle("Feature correlation weights") +
+    theme_minimal() +
+    theme(plot.title = element_text(size=15), axis.title.x = element_text(size = 15),
+          axis.title.y.left = element_text(size = 30), axis.title.x.bottom = element_text(size = 30),
+          axis.text.x.bottom = element_text(size = 30), axis.text.y.left = element_text(size = 30)) +
+    xlim(c(0,1)) + 
+    xlab("Feature weight") + 
+    ylab("Count")
+dev.off()
+
+#Train model and save
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, "models/disTwiner_minimumPercentileWeights.rds")
+```
+
+```{r evaluate classifier performance - mean of 10% min}
+model_type <- "minimumPercentileWeights"
+fit_EN_cv_oldyg <- readRDS(paste0("models/disTwiner_", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(ypredictions, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(ypredictions))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+
+#Distribution standard deviation
+std <- sd(ang_weight)
+saveRDS(std, paste0("model_evaluation/std/disTwiner_", model_type, "_std.rds"))
+
+# pdf("disTwiner_simulated_roc_mean.pdf")
+# cfit_test <- cv.glmnet(xdata[-itrain,], as.factor(ydata[-itrain]), family = "binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure = "auc", keep = TRUE)
+# rocs <- roc.glmnet(cfit_test$fit.preval, newy = as.factor(ydata[-itrain]))
+# best <- cfit_test$index["min",]
+# plot(rocs[[best]], type = "l")
+# invisible(sapply(rocs, lines, col="grey"))
+# lines(rocs[[best]], lwd = 2,col = "red")
+# dev.off()
+```
+
+```{r feature correlation weight - exponential score}
+# angular distance
+group_combs <- combn(length(group_cor),2)
+ang_weight_mat = matrix(0, nrow = dim(group_combs)[2], ncol = n_feats) #nrows is the number of combinations of the dataset groups in two slots
+
+# matrix of correlation vectors here, between each combination of groups
+
+# to penalize genes with smaller distances in the correlation matrix; try 1 - norm angle
+for (i in 1:n_feats){
+  for (k in 1:dim(group_combs)[2]) {
+    ang_weight_mat[k,i] <- exp(1 - acos(cosine(group_cor[[group_combs[1,k]]][,i],group_cor[[group_combs[2,k]]][,i]))/pi)
+  }
+}
+
+ang_weight <- apply(ang_weight_mat, 2, min) #what measurement of central tendency should we use is an open question
+
+pdf("twiner_synthetic_feature-weight_min_exp.pdf", width = 9)
+data.frame(weight = ang_weight) %>%
+  ggplot(aes(x = weight)) +
+    geom_histogram( binwidth=0.01, fill="#69b3a2", color="#e9ecef", alpha=0.9) +
+    ggtitle("") +
+    theme_minimal() +
+    theme(plot.title = element_text(size=15), axis.title.x = element_text(size = 15),
+          axis.title.y.left = element_text(size = 30), axis.title.x.bottom = element_text(size = 30),
+          axis.text.x.bottom = element_text(size = 30), axis.text.y.left = element_text(size = 30)) +
+    #xlim(c(0,1)) + 
+    xlab("Feature weight") + 
+    ylab("Count")
+dev.off()
+
+#Train model and save
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, "models/disTwiner_minimumExponentialWeights.rds")
+```
+
+```{r evaluate classifier performance - exponential score}
+model_type <- "minimumExponentialWeights"
+fit_EN_cv_oldyg <- readRDS(paste0("models/disTwiner_", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(ypredictions, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(ypredictions))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+
+#Distribution standard deviation
+std <- sd(ang_weight)
+saveRDS(std, paste0("model_evaluation/std/disTwiner_", model_type, "_std.rds"))
+
+# pdf("disTwiner_simulated_roc_mean.pdf")
+# cfit_test <- cv.glmnet(xdata[-itrain,], as.factor(ydata[-itrain]), family = "binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure = "auc", keep = TRUE)
+# rocs <- roc.glmnet(cfit_test$fit.preval, newy = as.factor(ydata[-itrain]))
+# best <- cfit_test$index["min",]
+# plot(rocs[[best]], type = "l")
+# invisible(sapply(rocs, lines, col="grey"))
+# lines(rocs[[best]], lwd = 2,col = "red")
+# dev.off()
+```
+
+```{r feature correlation weight - sigmoid score}
+# angular distance
+group_combs <- combn(length(group_cor),2)
+ang_weight_mat = matrix(0, nrow = dim(group_combs)[2], ncol = n_feats) #nrows is the number of combinations of the dataset groups in two slots
+
+# matrix of correlation vectors here, between each combination of groups
+
+# to penalize genes with smaller distances in the correlation matrix; try 1 - norm angle
+for (i in 1:n_feats){
+  for (k in 1:dim(group_combs)[2]) {
+    ang_weight_mat[k,i] <- 1/(1+exp(-(1 - acos(cosine(group_cor[[group_combs[1,k]]][,i],group_cor[[group_combs[2,k]]][,i]))/pi)))
+  }
+}
+
+ang_weight <- apply(ang_weight_mat, 2, min) #what measurement of central tendency should we use is an open question
+
+pdf("twiner_synthetic_feature-weight_min_sig.pdf", width = 9)
+data.frame(weight = ang_weight) %>%
+  ggplot(aes(x = weight)) +
+    geom_histogram( binwidth=0.01, fill="#69b3a2", color="#e9ecef", alpha=0.9) +
+    ggtitle("") +
+    theme_minimal() +
+    theme(plot.title = element_text(size=15), axis.title.x = element_text(size = 15),
+          axis.title.y.left = element_text(size = 30), axis.title.x.bottom = element_text(size = 30),
+          axis.text.x.bottom = element_text(size = 30), axis.text.y.left = element_text(size = 30)) +
+    #xlim(c(0,1)) + 
+    xlab("Feature weight") + 
+    ylab("Count")
+dev.off()
+
+#Train model and save
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, "models/disTwiner_minimumSigmoidWeights.rds")
+```
+
+```{r evaluate classifier performance - sigmoid score}
+model_type <- "minimumSigmoidWeights"
+fit_EN_cv_oldyg <- readRDS(paste0("models/disTwiner_", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(ypredictions, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(ypredictions))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+
+#Distribution standard deviation
+std <- sd(ang_weight)
+saveRDS(std, paste0("model_evaluation/std/disTwiner_", model_type, "_std.rds"))
+
+# pdf("disTwiner_simulated_roc_mean.pdf")
+# cfit_test <- cv.glmnet(xdata[-itrain,], as.factor(ydata[-itrain]), family = "binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure = "auc", keep = TRUE)
+# rocs <- roc.glmnet(cfit_test$fit.preval, newy = as.factor(ydata[-itrain]))
+# best <- cfit_test$index["min",]
+# plot(rocs[[best]], type = "l")
+# invisible(sapply(rocs, lines, col="grey"))
+# lines(rocs[[best]], lwd = 2,col = "red")
+# dev.off()
+```
+
+```{r evaluate classifier performance - svm}
+#Train model and save
+model_type <- "SVM"
+
+dataset <- data.frame(cbind(xdata, ydata))
+dataset$ydata <- factor(dataset$ydata, levels = c(0, 1)) 
+
+training_set = dataset[itrain,]
+test_set = dataset[-itrain,]
+
+training_set[,-101] = scale(training_set[,-101]) 
+test_set[,-101] = scale(test_set[,-101]) 
+
+classifier = svm(formula = ydata ~ ., 
+                 data = training_set, 
+                 type = 'C-classification', 
+                 kernel = 'linear', probability = TRUE)
+
+saveRDS(classifier, paste0("models/disTwiner_", model_type, ".rds"))
+
+y_pred = predict(classifier, newdata = test_set[,-101]) 
+
+# Accuracy and confusion matrix
+xtab <- table(y_pred, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(y_pred))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(classifier, newdata = test_set[-101], type = "prob", probability = TRUE)
+yprobabilities <- attr(yprobabilities,"probabilities")[,2]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+```
+
+```{r evaluate classifier performance - random forest}
+#Train model and save
+model_type <- "randomForest"
+
+xtrain <- xdata[itrain,]
+xtest <- xdata[-itrain,]
+ytrain <- as.factor(ydata[itrain])
+ytest <- as.factor(ydata[-itrain])
+
+rf <- randomForest(x = xtrain, y = ytrain, xtest = xtest, ytest = ytest)
+
+saveRDS(rf, paste0("models/disTwiner_", model_type, ".rds"))
+
+y_pred = rf$test$predicted 
+
+# Accuracy and confusion matrix
+xtab <- table(y_pred, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(y_pred))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- rf$test$votes[,2]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+```
+
+```{r evaluate classifier performance - logistic regression}
+#Train model and save
+model_type <- "logRegression"
+
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, paste0("models/disTwiner_", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(y_pred, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("model_evaluation/confusion_matrix/disTwiner_", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(y_pred))
+saveRDS(precision, paste0("model_evaluation/precision/disTwiner_", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(recall, paste0("model_evaluation/recall/disTwiner_", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(f1, paste0("model_evaluation/f1/disTwiner_", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
+```
+
+# Figure 2: Biological data set
+
+```{r load immune data}
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+  subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
+
+xdata <- t(as.matrix(GetAssayData(srt.immune, "data")))
+
+xdata <- xdata[,sapply(seq(ncol(xdata)), function(ix) {sd(xdata[,ix])}) != 0]
+
+ydata <- c(rep(0, length(srt.immune$Condition)))
+for (i in 1:length(srt.immune$Condition)) {
+  ydata[i] <- 0*(unname(srt.immune$Condition)[i] == "Young") + 1*(unname(srt.immune$Condition)[i] == "Old")
+}
+
+ydata <- as.numeric(ydata)
+
+ylabel <- as.character(unname(srt.immune$cell_label))
+
+data <- data.frame(xdata, y = ydata, label = ylabel)
+
+rm(srt.immune)
+
+itrain <- sort(sample(nrow(xdata), nrow(xdata)*.9))
+```
+
+```{r building correlation matrices}
+# this part should receive an arbitrary number of matrices
+groups <- unique(data[,'label'])
+group_list <- list()
+
+for (i in 1:length(groups)) {
+  group_list[[i]] <- data[which(data[,'label'] == groups[i]),!colnames(data) %in% c("y", "label")]
+}
+
+# filter genes with no sample variability
+for (i in 1:length(groups)) {
+  group_list[[i]] <- group_list[[i]][,sapply(seq(ncol(group_list[[i]])), function(ix) {sd(group_list[[i]][,ix])}) != 0]
+}
+
+# select only common genes between groups
+col_common = colnames(xdata)
+for (i in 1:length(group_list)){
+  col_common = intersect(col_common, colnames(group_list[[i]]))
+}
+
+group_list <- lapply(group_list, function(x) x[, col_common])
+
+xdata <- scale(xdata[, col_common])
+
+# normalizing data
+group_list <- lapply(group_list, scale)
+
+## correlation matrices
+# group_cor <- lapply(group_list, function (x) bigcor(x, y = NULL, fun = "cor", size = 2000, verbose=FALSE))
+# group_cor <- lapply(group_cor, function (x) as.data.frame(as.ffdf(x)))
+# group_cor <- lapply(group_cor, function (x) x %>% mutate(across(everything(), replace_na, 0)))
+group_cor <- readRDS("group_correlation_mat_macs.rds")
+```
+
+```{r gene correlation weight}
+group_combs <- combn(length(group_cor),2)
+n_feats <- dim(xdata)[2]
+ang_weight_mat = matrix(0, nrow = dim(group_combs)[2], ncol = n_feats) 
+for (i in 1:n_feats){
+  for (k in 1:dim(group_combs)[2]) {
+    ang_weight_mat[k,i] <- exp(1 - acos(cosine(group_cor[[group_combs[1,k]]][,i],group_cor[[group_combs[2,k]]][,i]))/pi)
+  }
+}
+
+ang_weight_mat[is.na(ang_weight_mat)] <- 0
+
+ang_weight <- apply(ang_weight_mat, 2, function(x) min(x[x > 0])) 
+
+pdf("disTwiner_macs_feature-weight.pdf", width = 9)
+data.frame(weight = ang_weight) %>%
+  ggplot(aes(x = weight)) +
+    geom_histogram( binwidth=0.01, fill="#69b3a2", color="#e9ecef", alpha=0.9) +
+    ggtitle("") +
+    theme_minimal() +
+    theme(plot.title = element_text(size=15), axis.title.x = element_text(size = 15),
+          axis.title.y.left = element_text(size = 30), axis.title.x.bottom = element_text(size = 30),
+          axis.text.x.bottom = element_text(size = 30), axis.text.y.left = element_text(size = 30)) +
+    xlim(c(0,1)) + 
+    xlab("Feature weight") + 
+    ylab("Count")
+dev.off()
+
+rm(group_cor, group_list, group_combs, data, ang_weight_mat)
+gc()
+
+#Train model and save
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, "models/disTwiner_macs.rds")
+```
+
+```{r evaluate disTwiner performance}
+model_type <- "disTwiner_macs"
+fit_EN_cv_oldyg <- readRDS(paste0("models/", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(ypredictions, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("real_data_evaluation/confusion_matrix/", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("real_data_evaluation/confusion_matrix/", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(ypredictions))
+saveRDS(precision, paste0("real_data_evaluation/precision/", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(recall, paste0("real_data_evaluation/recall/", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(f1, paste0("real_data_evaluation/f1/", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("real_data_evaluation/roc/", model_type, "_roc.rds"))
+
+#Distribution standard deviation
+std <- sd(ang_weight)
+saveRDS(std, paste0("real_data_evaluation/std/", model_type, "_std.rds"))
+
+var_selected_idx <- which(fit_EN_cv_oldyg$glmnet.fit$beta[,which(fit_EN_cv_oldyg$cvm == min(fit_EN_cv_oldyg$cvm))] != 0)
+var_selected <- colnames(xdata)[var_selected_idx]
+saveRDS(var_selected, paste0("selected_features/", model_type, "_features.rds"))
+```
+
+```{r evaluate SVM performance}
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+  subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
+
+xdata <- t(as.matrix(GetAssayData(srt.immune, "data")))
+
+xdata <- xdata[,sapply(seq(ncol(xdata)), function(ix) {sd(xdata[,ix])}) != 0]
+
+ydata <- c(rep(0, length(srt.immune$Condition)))
+for (i in 1:length(srt.immune$Condition)) {
+  ydata[i] <- 0*(unname(srt.immune$Condition)[i] == "Young") + 1*(unname(srt.immune$Condition)[i] == "Old")
+}
+
+ydata <- as.numeric(ydata)
+
+ylabel <- as.character(unname(srt.immune$cell_label))
+
+rm(srt.immune)
+
+model_type <- "SVM_macs"
+classifier <- readRDS(paste0("models/", model_type, ".rds"))
+
+dataset <- data.frame(cbind(xdata, ydata))
+dataset$ydata <- factor(dataset$ydata, levels = c(0, 1)) 
+
+training_set = dataset[itrain,]
+test_set = dataset[-itrain,]
+
+training_set[,-16836] = scale(training_set[,-16836]) 
+test_set[,-16836] = scale(test_set[,-16836]) 
+
+test_set_temp <- t(test_set)
+
+test_set2<- test_set[,which(complete.cases(test_set_temp))]
+
+y_pred = predict(classifier, newdata = test_set2[,-16645])
+
+# Accuracy and confusion matrix
+xtab <- table(y_pred, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("real_data_evaluation/confusion_matrix/", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("real_data_evaluation/confusion_matrix/", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(y_pred))
+saveRDS(precision, paste0("real_data_evaluation/precision/", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(recall, paste0("real_data_evaluation/recall/", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(f1, paste0("real_data_evaluation/f1/", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(classifier, newdata = test_set[-101], type = "prob", probability = TRUE)
+yprobabilities <- attr(yprobabilities,"probabilities")[,2]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("real_data_evaluation/roc/", model_type, "_roc.rds"))
+
+# var_selected_idx <- which(fit_EN_cv_oldyg$glmnet.fit$beta[,which(fit_EN_cv_oldyg$cvm == min(fit_EN_cv_oldyg$cvm))] != 0)
+# var_selected <- colnames(xdata)[var_selected_idx]
+# saveRDS(var_selected, paste0("selected_features/", model_type, "_features.rds"))
+```
+
+
+```{r assess if identified features are differentially expressed with age in the macrophage populations}
+# macs_fit <- cv.glmnet(xdata, as.factor(ydata), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+#
+# genes_selected_idx <- which(macs_fit$glmnet.fit$beta[,which(macs_fit$cvm == min(macs_fit$cvm))] != 0)
+#
+# genes_selected <- colnames(xdata)[genes_selected_idx]
+
+genes_selected <- readRDS("macs_cvglmnet_genes_selected.rds")
+
+genes_lfc <- data.frame(genes = genes_selected, late_lfc = NA, rep_lfc = NA, int_lfc = NA, reg1_lfc = NA, reg2_lfc = NA, inf_lfc = NA)
+
+late_age_deg <- read_excel('E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/old_v_young/all_aging_DEG.xlsx') %>% filter(cluster == 'lateMacs' & abs(avg_log2FC) > 0)
+rep_age_deg <- read_excel('E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/old_v_young/all_aging_DEG.xlsx') %>% filter(cluster == 'repMacs' & abs(avg_log2FC) > 0)
+int_age_deg <- read_excel('E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/old_v_young/all_aging_DEG.xlsx') %>% filter(cluster == 'intMacs' & abs(avg_log2FC) > 0)
+reg1_age_deg <- read_excel('E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/old_v_young/all_aging_DEG.xlsx') %>% filter(cluster == 'regMacs 1' & abs(avg_log2FC) > 0)
+reg2_age_deg <- read_excel('E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/old_v_young/all_aging_DEG.xlsx') %>% filter(cluster == 'regMacs 2' & abs(avg_log2FC) > 0)
+inf_age_deg <- read_excel('E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/old_v_young/all_aging_DEG.xlsx') %>% filter(cluster == 'infMacs' & abs(avg_log2FC) > 0)
+
+for (i in 1:length(genes_lfc$genes)) {
+  gene <- genes_lfc$genes[i]
+  
+  gene_late_idx <- which(late_age_deg$gene == gene)
+  if (length(gene_late_idx) == 1) {
+    genes_lfc$late_lfc[i] <- late_age_deg$avg_log2FC[gene_late_idx]
+  } else {
+    genes_lfc$late_lfc[i] <- 0
+  }
+  
+  gene_rep_idx <- which(rep_age_deg$gene == gene)
+  if (length(gene_rep_idx) == 1) {
+    genes_lfc$rep_lfc[i] <- rep_age_deg$avg_log2FC[gene_rep_idx]
+  } else {
+    genes_lfc$rep_lfc[i] <- 0
+  }
+  
+  gene_int_idx <- which(int_age_deg$gene == gene)
+  if (length(gene_int_idx) == 1) {
+    genes_lfc$int_lfc[i] <- int_age_deg$avg_log2FC[gene_int_idx]
+  } else {
+    genes_lfc$int_lfc[i] <- 0
+  }
+  
+  gene_reg1_idx <- which(reg1_age_deg$gene == gene)
+  if (length(gene_reg1_idx) == 1) {
+    genes_lfc$reg1_lfc[i] <- reg1_age_deg$avg_log2FC[gene_reg1_idx]
+  } else {
+    genes_lfc$reg1_lfc[i] <- 0
+  }
+  
+  gene_reg2_idx <- which(reg2_age_deg$gene == gene)
+  if (length(gene_reg2_idx) == 1) {
+    genes_lfc$reg2_lfc[i] <- reg2_age_deg$avg_log2FC[gene_reg2_idx]
+  } else {
+    genes_lfc$reg2_lfc[i] <- 0
+  }
+  
+  gene_inf_idx <- which(inf_age_deg$gene == gene)
+  if (length(gene_inf_idx) == 1) {
+    genes_lfc$inf_lfc[i] <- inf_age_deg$avg_log2FC[gene_inf_idx]
+  } else {
+    genes_lfc$inf_lfc[i] <- 0
+  }
+}
+
+genes_lfc <- genes_lfc %>% 
+  filter((abs(late_lfc) + abs(rep_lfc) + abs(int_lfc) + abs(reg1_lfc) + abs(reg2_lfc) + abs(inf_lfc)) != 0) %>%
+  arrange(rep_lfc)
+
+order <- genes_lfc$genes
+
+genes_lfc_long <- genes_lfc %>%
+  gather(key = "lfc", value = "value", 2:7)
+
+pdf("disTwiner_macs_lfc_gsea.pdf", height = 50)
+ggplot(genes_lfc_long, aes(x = lfc, y = factor(genes, levels = order), fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#075AFF",
+                       mid = "#FFFFCC",
+                       high = "#FF0000")
+dev.off()
+```
+
+```{r assess genes using GSEA to detect group-specific enrichment and compare it with standard enrichment analysis}
+genes_selected <- readRDS("macs_cvglmnet_genes_selected.rds")
+
+gene_sets = msigdbr(species = "mouse", category = "H")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+## REPMACS
+# Enrichment of repmacs without filtering of selected features
+markers_no_filter <- readRDS("dgea_output/dgea_macs_immune_clusters_fgsea.rds") %>%
+  filter(cluster == "repMacs")
+ranks_no_filter <- markers_no_filter$avg_log2FC
+names(ranks_no_filter) <- rownames(markers_no_filter)
+fgseaRes_no_filter <- fgsea(pathways = msigdbr_list,
+                  stats = ranks_no_filter,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="pos")
+
+fgseaResTidy_no_filter <- fgseaRes_no_filter %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+ggplot(fgseaResTidy_no_filter %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("repMacs - Non-filtered pathways"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+
+# Enrichment of repmacs with filtering of selected features
+markers <- readRDS("dgea_output/dgea_macs_immune_clusters_fgsea.rds") %>%
+  filter(cluster == "repMacs") %>%
+  filter(gene %in% genes_selected)
+ranks <- markers$avg_log2FC
+names(ranks) <- rownames(markers)
+fgseaRes <- fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="pos")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("repMacs - Filtered pathways"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+```
+
+```{r assess genes using CellChat and compare with previously obtained results - prepare cellchat}
+LogFC_threshold <- 0.2
+min.cell.group <- 40
+p_val <- 0.05
+CellChatDB <- CellChatDB.mouse
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds")
+srt.muscle <- readRDS("E:/Storage/rna_seq_datasets/muSC_v3_seurat_norm_annotated.rds")
+srt.muscle$cell_label <- gsub("Endo", "Endothelial cells", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("prolifSat", "Proliferating MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("lateFAPs", "Late−injury FAPs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("earlyFAPs", "Early−injury FAPs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("commitSat", "Committed MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("undefSat 1", "Undefined MuSCs 1", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("diffSat", "Differentiating MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("undefProg", "Undefined progenitor cells", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Cx3cr1Sat", "Cx3cr1−positive MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("undefSat 2", "Undefined MuSCs 2", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Teno", "Tenocytes", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Neural", "Neural/Schwann cells", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Myo", "Myocytes", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("activSat", "Quiescent/early activation MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Mural", "Mural cells", srt.muscle$cell_label)
+
+##3 DPI
+immune_cells_present <- c("repMacs", "intMacs", "lateMacs", "infMacs", "Prolif", "pDCs", "cDC1")
+immune_time_points <- c("yg3", "old3")
+muscle_cells_present <- c("Early−injury FAPs", "Undefined MuSCs 1", "Proliferating MuSCs", "Undefined progenitor cells", "Myocytes", "Committed MuSCs", "Endothelial cells", "Differentiating MuSCs", "Late−injury FAPs", "Quiescent/early activation MuSCs", "Mural cells")
+target_cell <- c("Proliferating MuSCs", "Committed MuSCs", "Differentiating MuSCs", "Quiescent/early activation MuSCs", "Undefined MuSCs 1")
+muscle_time_points <- c("yg3_5", "old3_5")
+de_genes_immune_path_cluster_yg <- 'E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/cluster/yg3_cluster_DEG.xlsx'
+de_genes_immune_path_cluster_old <- 'E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/cluster/old3_cluster_DEG.xlsx'
+de_genes_muscle_path_cluster_yg <- 'E:/Storage/bioinformatics/deg_results/muSC_v3_deg_mixed_annotation/cluster/yg3_5_cluster_DEG.xlsx'
+de_genes_muscle_path_cluster_old <- 'E:/Storage/bioinformatics/deg_results/muSC_v3_deg_mixed_annotation/cluster/old3_5_cluster_DEG.xlsx'
+de_genes_immune_path_age <- 'E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/old_v_young/dpi3_aging_DEG.xlsx'
+de_genes_muscle_path_age <- 'E:/Storage/bioinformatics/deg_results/muSC_v3_deg_mixed_annotation/old_v_young/dpi3_5_aging_DEG.xlsx'
+
+subdata.young.immune <- subset(x = srt.immune, subset = cell_label %in% immune_cells_present) %>% subset(subset = sample == immune_time_points[1])
+subdata.young.muscle <- subset(x = srt.muscle, subset = cell_label %in% muscle_cells_present) %>% subset(subset = sample == muscle_time_points[1])
+
+subdata.young <- merge(subdata.young.immune, y = subdata.young.muscle, add.cell.ids = c("immune", "muscle"), project = "merged_data",
+    merge.data = TRUE)
+rm(subdata.young.immune, subdata.young.muscle)
+Idents(subdata.young) <- "cell_label"
+
+DefaultAssay(subdata.young) <- 'RNA'
+
+subdata.young <-
+  NormalizeData(
+    subdata.young,
+    assay = 'RNA'
+  ) %>% FindVariableFeatures(
+    selection.method = 'vst',
+    nfeatures = 3000,
+    verbose = TRUE
+  ) %>% ScaleData(
+    assay = 'RNA',
+    verbose = TRUE
+  )
+
+cellchat.young <- createCellChat(object = subdata.young, group.by = "cell_label")
+cellchat.young@DB <- CellChatDB
+rm(subdata.young)
+
+subdata.old.immune <- subset(x = srt.immune, subset = cell_label %in% immune_cells_present) %>% subset(subset = sample == immune_time_points[2])
+subdata.old.muscle <- subset(x = srt.muscle, subset = cell_label %in% muscle_cells_present) %>% subset(subset = sample == muscle_time_points[2])
+
+subdata.old <- merge(subdata.old.immune, y = subdata.old.muscle, add.cell.ids = c("immune", "muscle"), project = "merged_data",
+    merge.data = TRUE)
+rm(subdata.old.immune, subdata.old.muscle)
+Idents(subdata.old) <- "cell_label"
+
+DefaultAssay(subdata.old) <- 'RNA'
+
+subdata.old <-
+  NormalizeData(
+    subdata.old,
+    assay = 'RNA'
+  ) %>% FindVariableFeatures(
+    selection.method = 'vst',
+    nfeatures = 3000,
+    verbose = TRUE
+  ) %>% ScaleData(
+    assay = 'RNA',
+    verbose = TRUE
+  )
+
+cellchat.old <- createCellChat(object = subdata.old, group.by = "cell_label")
+cellchat.old@DB <- CellChatDB
+rm(subdata.old)
+
+# create object with young data and compute communication
+cellchat.young <- subsetData(cellchat.young)
+cellchat.young <- identifyOverExpressedGenes(cellchat.young)
+# ---
+de_genes_immune_cluster <- read_excel(de_genes_immune_path_cluster_yg) %>% filter(gene %in% genes_selected)
+  
+de_genes_immune_cluster <- filter(de_genes_immune_cluster, cluster %in% immune_cells_present)
+de_genes_muscle_cluster <- read_excel(de_genes_muscle_path_cluster_yg) 
+
+de_genes_muscle_cluster$cluster <- gsub("Endo", "Endothelial cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("prolifSat", "Proliferating MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("lateFAPs", "Late−injury FAPs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("earlyFAPs", "Early−injury FAPs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("commitSat", "Committed MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefSat 1", "Undefined MuSCs 1", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("diffSat", "Differentiating MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefProg", "Undefined progenitor cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Cx3cr1Sat", "Cx3cr1−positive MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefSat 2", "Undefined MuSCs 2", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Teno", "Tenocytes", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Neural", "Neural/Schwann cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Myo", "Myocytes", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("activSat", "Quiescent/early activation MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Mural", "Mural cells", de_genes_muscle_cluster$cluster)
+
+de_genes_muscle_cluster <- filter(de_genes_muscle_cluster, cluster %in% muscle_cells_present)
+de_genes_cluster <- rbind(de_genes_immune_cluster, de_genes_muscle_cluster) %>% filter(avg_log2FC > LogFC_threshold)
+de_genes_cluster <- data.frame(clusters = de_genes_cluster$cluster, features = de_genes_cluster$gene, pvalues = de_genes_cluster$p_val, logFC = de_genes_cluster$avg_log2FC, pct.1 = de_genes_cluster$pct.1, pct.2 = de_genes_cluster$pct.2, pvalues.adj = de_genes_cluster$p_val_adj)
+cellchat.young@var.features$features.info <- de_genes_cluster
+cellchat.young@var.features[['features']] <- de_genes_cluster$features
+rm(de_genes_cluster, de_genes_immune_cluster, de_genes_muscle_cluster)
+# ---
+cellchat.young <- identifyOverExpressedInteractions(cellchat.young)
+cellchat.young <- projectData(cellchat.young, PPI.mouse)
+cellchat.young <- computeCommunProb(cellchat.young, raw.use = FALSE, population.size = FALSE)
+cellchat.young <- filterCommunication(cellchat.young, min.cells = min.cell.group)
+cellchat.young <- computeCommunProbPathway(cellchat.young)
+cellchat.young <- aggregateNet(cellchat.young)
+cellchat.young <- netAnalysis_computeCentrality(cellchat.young, slot.name = "netP")
+
+cellchat.old <- subsetData(cellchat.old)
+cellchat.old <- identifyOverExpressedGenes(cellchat.old)
+# ---
+de_genes_immune_cluster <- read_excel(de_genes_immune_path_cluster_old) %>% filter(gene %in% genes_selected)
+
+de_genes_immune_cluster <- filter(de_genes_immune_cluster, cluster %in% immune_cells_present)
+de_genes_muscle_cluster <- read_excel(de_genes_muscle_path_cluster_old) 
+
+de_genes_muscle_cluster$cluster <- gsub("Endo", "Endothelial cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("prolifSat", "Proliferating MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("lateFAPs", "Late−injury FAPs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("earlyFAPs", "Early−injury FAPs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("commitSat", "Committed MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefSat 1", "Undefined MuSCs 1", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("diffSat", "Differentiating MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefProg", "Undefined progenitor cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Cx3cr1Sat", "Cx3cr1−positive MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefSat 2", "Undefined MuSCs 2", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Teno", "Tenocytes", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Neural", "Neural/Schwann cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Myo", "Myocytes", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("activSat", "Quiescent/early activation MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Mural", "Mural cells", de_genes_muscle_cluster$cluster)
+
+de_genes_muscle_cluster <- filter(de_genes_muscle_cluster, cluster %in% muscle_cells_present)
+de_genes_cluster <- rbind(de_genes_immune_cluster, de_genes_muscle_cluster) %>% filter(avg_log2FC > LogFC_threshold)
+de_genes_cluster <- data.frame(clusters = de_genes_cluster$cluster, features = de_genes_cluster$gene, pvalues = de_genes_cluster$p_val, logFC = de_genes_cluster$avg_log2FC, pct.1 = de_genes_cluster$pct.1, pct.2 = de_genes_cluster$pct.2, pvalues.adj = de_genes_cluster$p_val_adj)
+cellchat.old@var.features$features.info <- de_genes_cluster
+cellchat.old@var.features[['features']] <- de_genes_cluster$features
+rm(de_genes_cluster, de_genes_immune_cluster, de_genes_muscle_cluster)
+# ---
+cellchat.old <- identifyOverExpressedInteractions(cellchat.old)
+cellchat.old <- projectData(cellchat.old, PPI.mouse)
+cellchat.old <- computeCommunProb(cellchat.old, raw.use = FALSE, population.size = FALSE)
+cellchat.old <- filterCommunication(cellchat.old, min.cells = min.cell.group)
+cellchat.old <- computeCommunProbPathway(cellchat.old)
+cellchat.old <- aggregateNet(cellchat.old)
+cellchat.old <- netAnalysis_computeCentrality(cellchat.old, slot.name = "netP")
+
+# join objects
+object.list <- list(Young = cellchat.young, Old = cellchat.old)
+cellchat <- mergeCellChat(object.list, add.names = names(object.list), cell.prefix = TRUE)
+
+pos.dataset = "Old"
+features.name = pos.dataset
+cellchat <- identifyOverExpressedGenes(cellchat, group.dataset = "datasets", pos.dataset = pos.dataset, features.name = features.name, only.pos = FALSE, thresh.pc = 0.1, thresh.fc = LogFC_threshold, thresh.p = p_val)
+# ---
+de_genes_immune_age <- read_excel(de_genes_immune_path_age) %>% filter(cluster %in% immune_cells_present) %>% filter(gene %in% genes_selected)
+de_genes_muscle_age <- read_excel(de_genes_muscle_path_age) 
+
+de_genes_muscle_age$cluster <- gsub("Endo", "Endothelial cells", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("prolifSat", "Proliferating MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("lateFAPs", "Late−injury FAPs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("earlyFAPs", "Early−injury FAPs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("commitSat", "Committed MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("undefSat 1", "Undefined MuSCs 1", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("diffSat", "Differentiating MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("undefProg", "Undefined progenitor cells", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Cx3cr1Sat", "Cx3cr1−positive MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("undefSat 2", "Undefined MuSCs 2", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Teno", "Tenocytes", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Neural", "Neural/Schwann cells", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Myo", "Myocytes", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("activSat", "Quiescent/early activation MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Mural", "Mural cells", de_genes_muscle_age$cluster)
+
+de_genes_muscle_age <- filter(de_genes_muscle_age, cluster %in% muscle_cells_present)
+de_genes_age <- rbind(de_genes_immune_age, de_genes_muscle_age) %>% filter(abs(avg_log2FC) > LogFC_threshold)
+de_genes_age <- data.frame(clusters = de_genes_age$cluster, features = de_genes_age$gene, pvalues = de_genes_age$p_val, logFC = de_genes_age$avg_log2FC, pct.1 = de_genes_age$pct.1, pct.2 = de_genes_age$pct.2, pvalues.adj = de_genes_age$p_val_adj)
+de_genes_age$datasets <-  NA
+for (i in 1:length(de_genes_age$datasets)) {
+  if (de_genes_age$logFC[i] < 0) {
+    de_genes_age$datasets[i] <- 'Young'
+  } else {
+    de_genes_age$datasets[i] <- 'Old'
+  }
+}
+cellchat@var.features$Old.info <- de_genes_age
+cellchat@var.features[['Old']] <- de_genes_age$features
+rm(de_genes_age, de_genes_immune_age, de_genes_muscle_age)
+# ---
+
+net <- netMappingDEG(cellchat, features.name = features.name)
+net.target_muSC <- filter(net, target %in% target_cell)
+net.target_muSC.source_immune <- filter(net.target_muSC, source %in% immune_cells_present)
+net.target_muSC.source_immune <- filter(net.target_muSC.source_immune, !is.na(ligand.pvalues))
+
+net.target_muSC.source_immune.secreted <- filter(net.target_muSC.source_immune, annotation == "Secreted Signaling")
+net.target_muSC.source_immune.contact <- filter(net.target_muSC.source_immune, annotation == "Cell-Cell Contact")
+net.target_muSC.source_immune.ecm <- filter(net.target_muSC.source_immune, annotation == "ECM-Receptor")
+
+net.target_muSC.source_immune.secreted.up <- filter(net.target_muSC.source_immune.secreted, (!is.na(receptor.logFC) & receptor.logFC > 0 & ligand.logFC > LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC > LogFC_threshold))
+net.target_muSC.source_immune.secreted.down <- filter(net.target_muSC.source_immune.secreted, (!is.na(receptor.logFC) & receptor.logFC < 0 & ligand.logFC < -LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC < -LogFC_threshold))
+
+net.target_muSC.source_immune.contact.up <- filter(net.target_muSC.source_immune.contact, (!is.na(receptor.logFC) & receptor.logFC > 0 & ligand.logFC > LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC > LogFC_threshold))
+net.target_muSC.source_immune.contact.down <- filter(net.target_muSC.source_immune.contact, (!is.na(receptor.logFC) & receptor.logFC < 0 & ligand.logFC < -LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC < -LogFC_threshold))
+
+net.target_muSC.source_immune.ecm.up <- filter(net.target_muSC.source_immune.ecm, (!is.na(receptor.logFC) & receptor.logFC > 0 & ligand.logFC > LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC > LogFC_threshold))
+net.target_muSC.source_immune.ecm.down <- filter(net.target_muSC.source_immune.ecm, (!is.na(receptor.logFC) & receptor.logFC < 0 & ligand.logFC < -LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC < -LogFC_threshold))
+```
+
+```{r assess genes using CellChat and compare with previously obtained results - plot results}
+colors.use <- c("#dda15e", "#780000", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#70e000", "#669bbc", "#c1121f", "#259638", "#003049", "#dda15e")
+
+pdf("twiner_lr_cellchat_3dpi_up_signaling.pdf", width = 10)
+netVisual_chord_gene(object.list[[2]], slot.name = 'net', net = net.target_muSC.source_immune.secreted.up, lab.cex = 0.8, small.gap = 3.5,  title.name = paste0("Up-regulated secreted signaling in ", names(object.list)[2]))
+dev.off()
+#netVisual_chord_gene(object.list[[2]], slot.name = 'net', net = net.target_muSC.source_immune.contact.up, lab.cex = 0.8, small.gap = 3.5, title.name = paste0("Up-regulated cell-cell contact in ", names(object.list)[2]))
+# netVisual_chord_gene(object.list[[2]], slot.name = 'net', net = net.target_muSC.source_immune.ecm.up, lab.cex = 0.8, small.gap = 3.5, title.name = paste0("Up-regulated ECM-receptor in ", names(object.list)[2]))
+
+# netVisual_chord_gene(object.list[[1]], slot.name = 'net', net = net.target_muSC.source_immune.secreted.down, lab.cex = 0.8, small.gap = 3.5, title.name = paste0("Down-regulated secreted signaling in ", names(object.list)[2]))
+pdf("twiner_lr_cellchat_3dpi_down_contact.pdf", width = 10)
+netVisual_chord_gene(object.list[[1]], slot.name = 'net', net = net.target_muSC.source_immune.contact.down, lab.cex = 0.8, small.gap = 3.5, title.name = paste0("Down-regulated cell-cell contact in ", names(object.list)[2]))
+dev.off()
+pdf("twiner_lr_cellchat_3dpi_down_ecm.pdf")
+netVisual_chord_gene(object.list[[1]], slot.name = 'net', net = net.target_muSC.source_immune.ecm.down, lab.cex = 1.2, small.gap = 3.5, title.name = paste0("Down-regulated ECM-receptor in ", names(object.list)[2]), color.use = colors.use, legend.pos.x = 5, legend.pos.y = 15)
+dev.off()
+```
+
+```{r compare classification with other classifiers}
+# Load data again
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+  subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
+
+xdata <- t(as.matrix(GetAssayData(srt.immune, "data")))
+
+xdata <- xdata[,sapply(seq(ncol(xdata)), function(ix) {sd(xdata[,ix])}) != 0]
+
+ydata <- c(rep(0, length(srt.immune$Condition)))
+for (i in 1:length(srt.immune$Condition)) {
+  ydata[i] <- 0*(unname(srt.immune$Condition)[i] == "Young") + 1*(unname(srt.immune$Condition)[i] == "Old")
+}
+
+rm(srt.immune)
+
+# Logistic regression with Elastic Net regularization
+set.seed(123)
+itrain <- sort(sample(nrow(xdata), nrow(xdata)*.9))
+
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, type.measure="mse")
+
+var_selected_idx <- which(fit_EN_cv_oldyg$glmnet.fit$beta[,which(fit_EN_cv_oldyg$cvm == min(fit_EN_cv_oldyg$cvm))] != 0)
+
+var_selected <- colnames(xdata)[var_selected_idx]
+
+print("Evaluate classifier on training data - Logistic + Elastic Net")
+assess.glmnet(fit_EN_cv_oldyg, newx = xdata[itrain, ], newy = as.factor(ydata[itrain]))
+
+cnf <- confusion.glmnet(fit_EN_cv_oldyg, newx = xdata[itrain, ], newy = as.factor(ydata[itrain]))
+print(cnf)
+
+cfit_train <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family = "binomial", nfolds=10, alpha=0.9, type.measure = "auc", keep = TRUE)
+rocs <- roc.glmnet(cfit_train$fit.preval, newy = as.factor(ydata[itrain]))
+best <- cfit_train$index["min",]
+plot(rocs[[best]], type = "l")
+invisible(sapply(rocs, lines, col="grey"))
+lines(rocs[[best]], lwd = 2,col = "red")
+
+print("Evaluate classifier on test data - Logistic + Elastic Net")
+assess.glmnet(fit_EN_cv_oldyg, newx = xdata[-itrain, ], newy = as.factor(ydata[-itrain]))
+
+cnf <- confusion.glmnet(fit_EN_cv_oldyg, newx = xdata[-itrain, ], newy = as.factor(ydata[-itrain]))
+print(cnf)
+saveRDS(cnf, "logistic_elastic_confusionmatrix.rds")
+
+pdf("logistic_macs_roc.pdf")
+cfit_test <- cv.glmnet(xdata[-itrain,], as.factor(ydata[-itrain]), family = "binomial", nfolds=10, alpha=0.9, type.measure = "auc", keep = TRUE)
+rocs <- roc.glmnet(cfit_test$fit.preval, newy = as.factor(ydata[-itrain]))
+best <- cfit_test$index["min",]
+plot(rocs[[best]], type = "l")
+invisible(sapply(rocs, lines, col="grey"))
+lines(rocs[[best]], lwd = 2,col = "red")
+dev.off()
+
+# Random forest
+
+xtrain <- xdata[itrain,]
+xtest <- xdata[-itrain,]
+ytrain <- as.factor(ydata[itrain])
+ytest <- as.factor(ydata[-itrain])
+
+rf <- randomForest(x = xtrain, y = ytrain, xtest = xtest, ytest = ytest)
+saveRDS(rf, "randomForest_model.rds")
+
+confusionMatrix(rf$predicted, reference = ytrain)
+confusionMatrix(rf$test$predicted, reference = ytest)
+
+predictions <- rf$test$votes
+predictions <- cbind(predictions, factor(as.numeric(rf$test$predicted) - 1))
+predictions <- cbind(predictions, factor(as.numeric(ytest) - 1))
+predictions[, 3:4] <- predictions[, 3:4] - 1
+predictions <- as.data.frame(predictions)
+colnames(predictions) = c("0", "1", "predict", "observed")
+
+precrec_obj <- evalmod(scores = predictions$predict, labels = predictions$observed)
+pdf("randomForest_macs_roc.pdf")
+autoplot(precrec_obj)
+dev.off()
+
+# SVM
+
+dataset <- data.frame(cbind(xdata, ydata))
+dataset$ydata <- factor(dataset$ydata, levels = c(0, 1)) 
+
+training_set = dataset[itrain,]
+test_set = dataset[-itrain,]
+
+training_set[,-16836] = scale(training_set[,-16836]) 
+test_set[,-16836] = scale(test_set[,-16836]) 
+
+classifier = svm(formula = ydata ~ ., 
+                 data = training_set, 
+                 type = 'C-classification', 
+                 kernel = 'linear') 
+
+y_pred = predict(classifier, newdata = test_set[-16836]) 
+
+cm = table(test_set[, 16836], y_pred) 
+saveRDS(cm, "SVM_confusionmatrix.rds")
+```
+
+```{r LR analysis with Twiner features only}
+LogFC_threshold <- 0.2
+min.cell.group <- 40
+p_val <- 0.05
+statistical_test <- "MAST"
+CellChatDB <- CellChatDB.mouse
+genes_selected <- readRDS("macs_cvglmnet_genes_selected.rds")
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds")
+srt.muscle <- readRDS("E:/Storage/rna_seq_datasets/muSC_v3_seurat_norm_annotated.rds")
+srt.muscle$cell_label <- gsub("Endo", "Endothelial cells", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("prolifSat", "Proliferating MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("lateFAPs", "Late−injury FAPs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("earlyFAPs", "Early−injury FAPs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("commitSat", "Committed MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("undefSat 1", "Undefined MuSCs 1", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("diffSat", "Differentiating MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("undefProg", "Undefined progenitor cells", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Cx3cr1Sat", "Cx3cr1−positive MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("undefSat 2", "Undefined MuSCs 2", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Teno", "Tenocytes", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Neural", "Neural/Schwann cells", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Myo", "Myocytes", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("activSat", "Quiescent/early activation MuSCs", srt.muscle$cell_label)
+srt.muscle$cell_label <- gsub("Mural", "Mural cells", srt.muscle$cell_label)
+
+##3 DPI
+immune_cells_present <- c("repMacs", "intMacs", "lateMacs", "infMacs", "Prolif", "pDCs", "cDC1")
+immune_time_points <- c("yg3", "old3")
+muscle_cells_present <- c("Early−injury FAPs", "Undefined MuSCs 1", "Proliferating MuSCs", "Undefined progenitor cells", "Myocytes", "Committed MuSCs", "Endothelial cells", "Differentiating MuSCs", "Late−injury FAPs", "Quiescent/early activation MuSCs", "Mural cells")
+target_cell <- c("Proliferating MuSCs", "Committed MuSCs", "Differentiating MuSCs", "Quiescent/early activation MuSCs", "Undefined MuSCs 1")
+muscle_time_points <- c("yg3_5", "old3_5")
+de_genes_muscle_path_cluster_yg <- 'E:/Storage/bioinformatics/deg_results/muSC_v3_deg_mixed_annotation/cluster/yg3_5_cluster_DEG.xlsx'
+de_genes_muscle_path_cluster_old <- 'E:/Storage/bioinformatics/deg_results/muSC_v3_deg_mixed_annotation/cluster/old3_5_cluster_DEG.xlsx'
+de_genes_muscle_path_age <- 'E:/Storage/bioinformatics/deg_results/muSC_v3_deg_mixed_annotation/old_v_young/dpi3_5_aging_DEG.xlsx'
+
+subdata.immune <- subset(x = srt.immune, subset = cell_label %in% immune_cells_present)
+subdata.young.immune <- subset(x = srt.immune, subset = cell_label %in% immune_cells_present) %>% subset(subset = sample == immune_time_points[1])
+subdata.young.muscle <- subset(x = srt.muscle, subset = cell_label %in% muscle_cells_present) %>% subset(subset = sample == muscle_time_points[1])
+
+subdata.young <- merge(subdata.young.immune, y = subdata.young.muscle, add.cell.ids = c("immune", "muscle"), project = "merged_data",
+    merge.data = TRUE)
+rm(subdata.young.muscle)
+Idents(subdata.young) <- "cell_label"
+
+DefaultAssay(subdata.young) <- 'RNA'
+
+subdata.young <-
+  NormalizeData(
+    subdata.young,
+    assay = 'RNA'
+  ) %>% FindVariableFeatures(
+    selection.method = 'vst',
+    nfeatures = 3000,
+    verbose = TRUE
+  ) %>% ScaleData(
+    assay = 'RNA',
+    verbose = TRUE
+  )
+
+cellchat.young <- createCellChat(object = subdata.young, group.by = "cell_label")
+cellchat.young@DB <- CellChatDB
+rm(subdata.young)
+
+subdata.old.immune <- subset(x = srt.immune, subset = cell_label %in% immune_cells_present) %>% subset(subset = sample == immune_time_points[2])
+subdata.old.muscle <- subset(x = srt.muscle, subset = cell_label %in% muscle_cells_present) %>% subset(subset = sample == muscle_time_points[2])
+
+subdata.old <- merge(subdata.old.immune, y = subdata.old.muscle, add.cell.ids = c("immune", "muscle"), project = "merged_data",
+    merge.data = TRUE)
+rm(subdata.old.muscle)
+Idents(subdata.old) <- "cell_label"
+
+DefaultAssay(subdata.old) <- 'RNA'
+
+subdata.old <-
+  NormalizeData(
+    subdata.old,
+    assay = 'RNA'
+  ) %>% FindVariableFeatures(
+    selection.method = 'vst',
+    nfeatures = 3000,
+    verbose = TRUE
+  ) %>% ScaleData(
+    assay = 'RNA',
+    verbose = TRUE
+  )
+
+cellchat.old <- createCellChat(object = subdata.old, group.by = "cell_label")
+cellchat.old@DB <- CellChatDB
+rm(subdata.old)
+
+# create object with young data and compute communication
+cellchat.young <- subsetData(cellchat.young)
+cellchat.young <- identifyOverExpressedGenes(cellchat.young)
+# ---
+Idents(subdata.young.immune) <- "cell_label"
+de_genes_immune_cluster <- FindAllMarkers(subdata.young.immune,
+                                          return.thresh = 1,
+                                          logfc.threshold = LogFC_threshold,
+                                          features = genes_selected,
+                                          test.use = statistical_test,
+                                          min.cells.group = min.cell.group)
+  
+de_genes_immune_cluster <- filter(de_genes_immune_cluster, cluster %in% immune_cells_present)
+de_genes_muscle_cluster <- read_excel(de_genes_muscle_path_cluster_yg) 
+
+de_genes_muscle_cluster$cluster <- gsub("Endo", "Endothelial cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("prolifSat", "Proliferating MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("lateFAPs", "Late−injury FAPs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("earlyFAPs", "Early−injury FAPs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("commitSat", "Committed MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefSat 1", "Undefined MuSCs 1", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("diffSat", "Differentiating MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefProg", "Undefined progenitor cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Cx3cr1Sat", "Cx3cr1−positive MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefSat 2", "Undefined MuSCs 2", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Teno", "Tenocytes", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Neural", "Neural/Schwann cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Myo", "Myocytes", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("activSat", "Quiescent/early activation MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Mural", "Mural cells", de_genes_muscle_cluster$cluster)
+
+de_genes_muscle_cluster <- filter(de_genes_muscle_cluster, cluster %in% muscle_cells_present)
+de_genes_cluster <- rbind(de_genes_immune_cluster, de_genes_muscle_cluster) %>% filter(avg_log2FC > LogFC_threshold)
+de_genes_cluster <- data.frame(clusters = de_genes_cluster$cluster, features = de_genes_cluster$gene, pvalues = de_genes_cluster$p_val, logFC = de_genes_cluster$avg_log2FC, pct.1 = de_genes_cluster$pct.1, pct.2 = de_genes_cluster$pct.2, pvalues.adj = de_genes_cluster$p_val_adj)
+cellchat.young@var.features$features.info <- de_genes_cluster
+cellchat.young@var.features[['features']] <- de_genes_cluster$features
+rm(de_genes_cluster, de_genes_immune_cluster, de_genes_muscle_cluster)
+# ---
+cellchat.young <- identifyOverExpressedInteractions(cellchat.young)
+cellchat.young <- projectData(cellchat.young, PPI.mouse)
+cellchat.young <- computeCommunProb(cellchat.young, raw.use = FALSE, population.size = FALSE)
+cellchat.young <- filterCommunication(cellchat.young, min.cells = min.cell.group)
+cellchat.young <- computeCommunProbPathway(cellchat.young)
+cellchat.young <- aggregateNet(cellchat.young)
+cellchat.young <- netAnalysis_computeCentrality(cellchat.young, slot.name = "netP")
+
+cellchat.old <- subsetData(cellchat.old)
+cellchat.old <- identifyOverExpressedGenes(cellchat.old)
+# ---
+Idents(subdata.old.immune) <- "cell_label"
+de_genes_immune_cluster <- FindAllMarkers(subdata.old.immune,
+                                          return.thresh = 1,
+                                          logfc.threshold = LogFC_threshold,
+                                          features = genes_selected,
+                                          test.use = statistical_test,
+                                          min.cells.group = min.cell.group)
+
+de_genes_immune_cluster <- filter(de_genes_immune_cluster, cluster %in% immune_cells_present)
+de_genes_muscle_cluster <- read_excel(de_genes_muscle_path_cluster_old) 
+
+de_genes_muscle_cluster$cluster <- gsub("Endo", "Endothelial cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("prolifSat", "Proliferating MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("lateFAPs", "Late−injury FAPs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("earlyFAPs", "Early−injury FAPs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("commitSat", "Committed MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefSat 1", "Undefined MuSCs 1", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("diffSat", "Differentiating MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefProg", "Undefined progenitor cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Cx3cr1Sat", "Cx3cr1−positive MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("undefSat 2", "Undefined MuSCs 2", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Teno", "Tenocytes", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Neural", "Neural/Schwann cells", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Myo", "Myocytes", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("activSat", "Quiescent/early activation MuSCs", de_genes_muscle_cluster$cluster)
+de_genes_muscle_cluster$cluster <- gsub("Mural", "Mural cells", de_genes_muscle_cluster$cluster)
+
+de_genes_muscle_cluster <- filter(de_genes_muscle_cluster, cluster %in% muscle_cells_present)
+de_genes_cluster <- rbind(de_genes_immune_cluster, de_genes_muscle_cluster) %>% filter(avg_log2FC > LogFC_threshold)
+de_genes_cluster <- data.frame(clusters = de_genes_cluster$cluster, features = de_genes_cluster$gene, pvalues = de_genes_cluster$p_val, logFC = de_genes_cluster$avg_log2FC, pct.1 = de_genes_cluster$pct.1, pct.2 = de_genes_cluster$pct.2, pvalues.adj = de_genes_cluster$p_val_adj)
+cellchat.old@var.features$features.info <- de_genes_cluster
+cellchat.old@var.features[['features']] <- de_genes_cluster$features
+rm(de_genes_cluster, de_genes_immune_cluster, de_genes_muscle_cluster)
+# ---
+cellchat.old <- identifyOverExpressedInteractions(cellchat.old)
+cellchat.old <- projectData(cellchat.old, PPI.mouse)
+cellchat.old <- computeCommunProb(cellchat.old, raw.use = FALSE, population.size = FALSE)
+cellchat.old <- filterCommunication(cellchat.old, min.cells = min.cell.group)
+cellchat.old <- computeCommunProbPathway(cellchat.old)
+cellchat.old <- aggregateNet(cellchat.old)
+cellchat.old <- netAnalysis_computeCentrality(cellchat.old, slot.name = "netP")
+
+# join objects
+object.list <- list(Young = cellchat.young, Old = cellchat.old)
+cellchat <- mergeCellChat(object.list, add.names = names(object.list), cell.prefix = TRUE)
+
+pos.dataset = "Old"
+features.name = pos.dataset
+cellchat <- identifyOverExpressedGenes(cellchat, group.dataset = "datasets", pos.dataset = pos.dataset, features.name = features.name, only.pos = FALSE, thresh.pc = 0.1, thresh.fc = LogFC_threshold, thresh.p = 1)
+# ---
+Idents(subdata.immune) <- "cell_label"
+de_genes_immune_age <- data.frame()
+for (i in unique(subdata.immune$cell_label)) {
+  subsubdata <- subset(subdata.immune, subset = cell_label == i)
+  Idents(subsubdata) <- "Condition"
+  temp <- FindMarkers(subsubdata,
+                      ident.1 = "Old", ident.2 = "Young",
+                      logfc.threshold = LogFC_threshold,
+                      features = genes_selected,
+                      test.use = statistical_test)
+  temp$cluster = i
+  temp$gene =rownames(temp)
+  de_genes_immune_age <- rbind(de_genes_immune_age, temp)
+}
+de_genes_immune_age <- de_genes_immune_age %>% filter(cluster %in% immune_cells_present)
+de_genes_muscle_age <- read_excel(de_genes_muscle_path_age) 
+
+de_genes_muscle_age$cluster <- gsub("Endo", "Endothelial cells", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("prolifSat", "Proliferating MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("lateFAPs", "Late−injury FAPs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("earlyFAPs", "Early−injury FAPs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("commitSat", "Committed MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("undefSat 1", "Undefined MuSCs 1", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("diffSat", "Differentiating MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("undefProg", "Undefined progenitor cells", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Cx3cr1Sat", "Cx3cr1−positive MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("undefSat 2", "Undefined MuSCs 2", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Teno", "Tenocytes", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Neural", "Neural/Schwann cells", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Myo", "Myocytes", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("activSat", "Quiescent/early activation MuSCs", de_genes_muscle_age$cluster)
+de_genes_muscle_age$cluster <- gsub("Mural", "Mural cells", de_genes_muscle_age$cluster)
+
+de_genes_muscle_age <- filter(de_genes_muscle_age, cluster %in% muscle_cells_present)
+de_genes_age <- rbind(de_genes_immune_age, de_genes_muscle_age) %>% filter(abs(avg_log2FC) > LogFC_threshold)
+de_genes_age <- data.frame(clusters = de_genes_age$cluster, features = de_genes_age$gene, pvalues = de_genes_age$p_val, logFC = de_genes_age$avg_log2FC, pct.1 = de_genes_age$pct.1, pct.2 = de_genes_age$pct.2, pvalues.adj = de_genes_age$p_val_adj)
+de_genes_age$datasets <-  NA
+for (i in 1:length(de_genes_age$datasets)) {
+  if (de_genes_age$logFC[i] < 0) {
+    de_genes_age$datasets[i] <- 'Young'
+  } else {
+    de_genes_age$datasets[i] <- 'Old'
+  }
+}
+cellchat@var.features$Old.info <- de_genes_age
+cellchat@var.features[['Old']] <- de_genes_age$features
+rm(de_genes_age, de_genes_immune_age, de_genes_muscle_age)
+# ---
+
+net <- netMappingDEG(cellchat, features.name = features.name)
+net.target_muSC <- filter(net, target %in% target_cell)
+net.target_muSC.source_immune <- filter(net.target_muSC, source %in% immune_cells_present)
+net.target_muSC.source_immune <- filter(net.target_muSC.source_immune, !is.na(ligand.pvalues))
+
+net.target_muSC.source_immune.secreted <- filter(net.target_muSC.source_immune, annotation == "Secreted Signaling")
+net.target_muSC.source_immune.contact <- filter(net.target_muSC.source_immune, annotation == "Cell-Cell Contact")
+net.target_muSC.source_immune.ecm <- filter(net.target_muSC.source_immune, annotation == "ECM-Receptor")
+
+net.target_muSC.source_immune.secreted.up <- filter(net.target_muSC.source_immune.secreted, (!is.na(receptor.logFC) & receptor.logFC > 0 & ligand.logFC > LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC > LogFC_threshold))
+net.target_muSC.source_immune.secreted.down <- filter(net.target_muSC.source_immune.secreted, (!is.na(receptor.logFC) & receptor.logFC < 0 & ligand.logFC < -LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC < -LogFC_threshold))
+
+net.target_muSC.source_immune.contact.up <- filter(net.target_muSC.source_immune.contact, (!is.na(receptor.logFC) & receptor.logFC > 0 & ligand.logFC > LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC > LogFC_threshold))
+net.target_muSC.source_immune.contact.down <- filter(net.target_muSC.source_immune.contact, (!is.na(receptor.logFC) & receptor.logFC < 0 & ligand.logFC < -LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC < -LogFC_threshold))
+
+net.target_muSC.source_immune.ecm.up <- filter(net.target_muSC.source_immune.ecm, (!is.na(receptor.logFC) & receptor.logFC > 0 & ligand.logFC > LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC > LogFC_threshold))
+net.target_muSC.source_immune.ecm.down <- filter(net.target_muSC.source_immune.ecm, (!is.na(receptor.logFC) & receptor.logFC < 0 & ligand.logFC < -LogFC_threshold) | (is.na(receptor.logFC) & ligand.logFC < -LogFC_threshold))
+
+colors.use <- c("#dda15e", "#780000", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#dda15e", "#70e000", "#669bbc", "#c1121f", "#259638", "#003049", "#dda15e")
+
+pdf("twiner_lr_cellchat_3dpi_up_signaling_twinerOnly.pdf", width = 10)
+netVisual_chord_gene(object.list[[2]], slot.name = 'net', net = net.target_muSC.source_immune.secreted.up, lab.cex = 0.8, small.gap = 3.5,  title.name = paste0("Up-regulated secreted signaling in ", names(object.list)[2]))
+dev.off()
+#netVisual_chord_gene(object.list[[2]], slot.name = 'net', net = net.target_muSC.source_immune.contact.up, lab.cex = 0.8, small.gap = 3.5, title.name = paste0("Up-regulated cell-cell contact in ", names(object.list)[2]))
+# netVisual_chord_gene(object.list[[2]], slot.name = 'net', net = net.target_muSC.source_immune.ecm.up, lab.cex = 0.8, small.gap = 3.5, title.name = paste0("Up-regulated ECM-receptor in ", names(object.list)[2]))
+
+pdf("twiner_lr_cellchat_3dpi_down_signaling_twinerOnly.pdf", width = 10)
+netVisual_chord_gene(object.list[[1]], slot.name = 'net', net = net.target_muSC.source_immune.secreted.down, lab.cex = 0.8, small.gap = 3.5, title.name = paste0("Down-regulated secreted signaling in ", names(object.list)[2]))
+dev.off()
+pdf("twiner_lr_cellchat_3dpi_down_contact_twinerOnly.pdf", width = 10)
+netVisual_chord_gene(object.list[[1]], slot.name = 'net', net = net.target_muSC.source_immune.contact.down, lab.cex = 0.8, small.gap = 3.5, title.name = paste0("Down-regulated cell-cell contact in ", names(object.list)[2]))
+dev.off()
+pdf("twiner_lr_cellchat_3dpi_down_ecm_twinerOnly.pdf")
+netVisual_chord_gene(object.list[[1]], slot.name = 'net', net = net.target_muSC.source_immune.ecm.down, lab.cex = 1.2, small.gap = 3.5, title.name = paste0("Down-regulated ECM-receptor in ", names(object.list)[2]), color.use = colors.use, legend.pos.x = 5, legend.pos.y = 15)
+dev.off()
+
+```
+
