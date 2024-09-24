@@ -1,0 +1,222 @@
+---
+title: "Twinner analysis to identify features distinguishing macrophage groups"
+author: "Tiago M. Costa"
+date: "January, 2024"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+  pdf_document:
+    number_sections: yes"N"
+    toc: yes
+---
+
+```{r libraries, include=FALSE}
+suppressMessages(library(Seurat))
+suppressMessages(library(dplyr))
+suppressMessages(library(propagate))
+suppressMessages(library(lsa))
+suppressMessages(library(glmnet))
+suppressMessages(library(VennDiagram))
+suppressMessages(library(readxl))
+suppressMessages(library(tidyr))
+suppressMessages(library(ggplot2))
+```
+
+```{r create synthetic data, include=FALSE}
+# https://www.r-bloggers.com/2016/02/generating-and-visualizing-multivariate-data-with-r/
+
+library(MASS)
+
+# Mean
+mu_a_yg <- c(0,0,0)
+mu_b_yg <- c(10,0,0)
+mu_c_yg <- c(10,10,10)
+
+mu_a_old <- c(5,0,10)
+mu_b_old <- c(15,10,5)
+mu_c_old <- c(15,0,5)
+# Covariance matrix
+sigma_a_yg <- matrix(c(1, .5, .5, .5, 1, .5, .5, .5, 1), 3)  
+sigma_b_yg <- matrix(c(1, .25, .25, .25, 1, .25, .25, .25, 1), 3)  
+sigma_c_yg <- matrix(c(1, .75, .75, .75, 1, .75, .75, .75, 1), 3)  
+
+sigma_a_old <- matrix(c(1, .9, .9, .9, 1, .9, .9, .9, 1), 3)  
+sigma_b_old <- matrix(c(1, .51, .51, .51, 1, .51, .51, .51, 1), 3)  
+sigma_c_old <- matrix(c(1, .5, .5, .5, 1, .5, .5, .5, 1), 3)  
+
+# Generate sample from N(mu, Sigma)
+bivn_a_yg <- mvrnorm(2000, mu = mu_a_yg, Sigma = sigma_a_yg )
+bivn_b_yg <- mvrnorm(1000, mu = mu_b_yg, Sigma = sigma_b_yg )
+bivn_c_yg <- mvrnorm(2000, mu = mu_c_yg, Sigma = sigma_c_yg )
+
+bivn_a_old <- mvrnorm(1500, mu = mu_a_old, Sigma = sigma_a_old )
+bivn_b_old <- mvrnorm(2000, mu = mu_b_old, Sigma = sigma_b_old )
+bivn_c_old <- mvrnorm(1000, mu = mu_c_old, Sigma = sigma_c_old )
+
+# # Calculate kernel density estimate
+# bivn_a_yg.kde <- kde2d(bivn_a_yg[,1], bivn_a_yg[,2], n = 50)   # from MASS package
+# bivn_b_yg.kde <- kde2d(bivn_b_yg[,1], bivn_b_yg[,2], n = 50)   # from MASS package
+# bivn_c_yg.kde <- kde2d(bivn_c_yg[,1], bivn_c_yg[,2], n = 50)   # from MASS package
+# 
+# bivn_a_old.kde <- kde2d(bivn_a_old[,1], bivn_a_old[,2], n = 50)   # from MASS package
+# bivn_b_old.kde <- kde2d(bivn_b_old[,1], bivn_b_old[,2], n = 50)   # from MASS package
+# bivn_c_old.kde <- kde2d(bivn_c_old[,1], bivn_c_old[,2], n = 50)   # from MASS package
+
+# Contour plot overlayed on heat map image of results
+# image(bivn.kde)       # from base graphics package
+# contour(bivn.kde, add = TRUE)     # from base graphics package
+
+y_a <- c(rep(0, 2000), rep(1, 1500))
+y_b <- c(rep(0, 1000), rep(1, 2000))
+y_c <- c(rep(0, 2000), rep(1, 1000))
+
+x_a <- rbind(bivn_a_yg, bivn_a_old)
+x_b <- rbind(bivn_b_yg, bivn_b_old)
+x_c <- rbind(bivn_c_yg, bivn_c_old)
+
+xdata <- scale(rbind(x_a, x_b, x_c))
+ydata <- c(y_a, y_b, y_c)
+ylabel <- c(rep("a",length(y_a)), rep("b",length(y_b)), rep("c", length(y_b)))
+
+xdata_less <- xdata
+```
+
+# Classification modeling
+
+Classification by sparse logistic regression.
+
+```{r building weight vector for penalizing genes with smaller distance in correlation matrices}
+# normalizing data
+x_a_norm <- scale(x_a)
+x_b_norm <- scale(x_b)
+x_c_norm <- scale(x_c)
+
+## correlation matrices
+
+x_a_cor <- bigcor(x_a_norm, y = NULL, fun = "cor", size = 2000, verbose=FALSE)
+x_a_cor <- as.data.frame(as.ffdf(x_a_cor))
+
+x_b_cor <- bigcor(x_b_norm, y = NULL, fun = "cor", size = 2000, verbose=FALSE)
+x_b_cor <- as.data.frame(as.ffdf(x_b_cor))
+
+x_c_cor <- bigcor(x_c_norm, y = NULL, fun = "cor", size = 2000, verbose=FALSE)
+x_c_cor <- as.data.frame(as.ffdf(x_c_cor))
+
+# angular distance
+ang_weight_mat = matrix(, nrow = 3, ncol = 3) #nrows is the number of combinations of the dataset groups in two slots
+
+# matrix of correlation vectors here, between each combination of groups
+
+# to penalize genes with smaller distances in the correlation matrix; try 1 - norm angle
+for (i in 1:3){
+  ang_weight_mat[1,i] <- 1 - acos(cosine(x_a_cor[,i],x_b_cor[,i]))/pi
+  
+  ang_weight_mat[2,i] <- 1 - acos(cosine(x_a_cor[,i],x_c_cor[,i]))/pi
+  
+  ang_weight_mat[3,i] <- 1 - acos(cosine(x_b_cor[,i],x_c_cor[,i]))/pi
+}
+
+hist(ang_weight_mat[,1])
+hist(ang_weight_mat[,2])
+hist(ang_weight_mat[,3])
+
+ang_weight <- apply(ang_weight_mat, 2, mean) #what measurement of central tendency should we use is an open question
+```
+
+```{r fit glm with the penalties from correlation vectors}
+fit_EN_cv_Late_oldyg <- cv.glmnet(x.lateMacs_norm, as.factor(y.lateMacs), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+var_selected_EN_Late_oldyg_idx <- which(fit_EN_cv_Late_oldyg$glmnet.fit$beta[,which(fit_EN_cv_Late_oldyg$cvm == min(fit_EN_cv_Late_oldyg$cvm))] != 0)
+
+var_selected_Late <- colnames(x.lateMacs_norm)[var_selected_EN_Late_oldyg_idx]
+
+fit_EN_cv_Rep_oldyg <- cv.glmnet(x.repMacs_norm, as.factor(y.repMacs), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+var_selected_EN_Rep_oldyg_idx <- which(fit_EN_cv_Rep_oldyg$glmnet.fit$beta[,which(fit_EN_cv_Rep_oldyg$cvm == min(fit_EN_cv_Rep_oldyg$cvm))] != 0)
+
+var_selected_Rep <- colnames(x.repMacs_norm)[var_selected_EN_Rep_oldyg_idx]
+
+venn.diagram(x = list(var_selected_Late, var_selected_Rep), 
+             category.names = c("Late" , "Rep"),
+             filename = 'twinner_venn_diagramm.png',
+             output=TRUE)
+```
+
+```{r assess if identified features are differentially expressed with age in the macrophage populations}
+features_lfc <- data.frame(genes = union(var_selected_Late, var_selected_Rep), late_lfc = NA, rep_lfc = NA)
+
+late_age_deg <- read_excel('E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/old_v_young/all_aging_DEG.xlsx') %>% filter(cluster == 'lateMacs' & abs(avg_log2FC) > 0.2)
+
+rep_age_deg <- read_excel('E:/Storage/bioinformatics/deg_results/immune_deg_mixed_annotation/old_v_young/all_aging_DEG.xlsx') %>% filter(cluster == 'repMacs' & abs(avg_log2FC) > 0.2)
+
+for (i in 1:length(features_lfc$genes)) {
+  feat <- features_lfc$genes[i]
+  
+  feat_late_idx <- which(late_age_deg$gene == feat)
+  if (length(feat_late_idx) == 1) {
+    features_lfc$late_lfc[i] <- late_age_deg$avg_log2FC[feat_late_idx]
+  } else {
+    features_lfc$late_lfc[i] <- 0
+  }
+  
+  feat_rep_idx <- which(rep_age_deg$gene == feat)
+  if (length(feat_rep_idx) == 1) {
+    features_lfc$rep_lfc[i] <- rep_age_deg$avg_log2FC[feat_rep_idx]
+  } else {
+    features_lfc$rep_lfc[i] <- 0
+  }
+}
+
+features_lfc <- features_lfc %>% 
+  filter(late_lfc != 0 | rep_lfc != 0) %>%
+  arrange(late_lfc)
+
+order <- features_lfc$genes
+
+features_lfc_long <- features_lfc %>%
+  gather(key = "lfc", value = "value", 2:3)
+
+ggplot(features_lfc_long, aes(x = lfc, y = factor(genes, levels = order), fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#075AFF",
+                       mid = "#FFFFCC",
+                       high = "#FF0000")
+```
+
+```{r evaluate classifier performance}
+itrain <- sort(sample(nrow(xdata_less), nrow(xdata_less)*.9))
+
+fit_EN_cv_oldyg <- cv.glmnet(xdata_less[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+var_selected_idx <- which(fit_EN_cv_oldyg$glmnet.fit$beta[,which(fit_EN_cv_oldyg$cvm == min(fit_EN_cv_oldyg$cvm))] != 0)
+
+var_selected <- colnames(xdata_less)[var_selected_idx]
+
+print("Evaluate classifier on training data")
+assess.glmnet(fit_EN_cv_oldyg, newx = xdata_less[itrain, ], newy = as.factor(ydata[itrain]))
+
+cnf <- confusion.glmnet(fit_EN_cv_oldyg, newx = xdata_less[itrain, ], newy = as.factor(ydata[itrain]))
+print(cnf)
+
+cfit_train <- cv.glmnet(xdata_less[itrain,], as.factor(ydata[itrain]), family = "binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure = "auc", keep = TRUE)
+rocs <- roc.glmnet(cfit_train$fit.preval, newy = as.factor(ydata[itrain]))
+best <- cfit_train$index["min",]
+plot(rocs[[best]], type = "l")
+invisible(sapply(rocs, lines, col="grey"))
+lines(rocs[[best]], lwd = 2,col = "red")
+
+print("Evaluate classifier on test data")
+assess.glmnet(fit_EN_cv_oldyg, newx = xdata_less[-itrain, ], newy = as.factor(ydata[-itrain]))
+
+cnf <- confusion.glmnet(fit_EN_cv_oldyg, newx = xdata_less[-itrain, ], newy = as.factor(ydata[-itrain]))
+print(cnf)
+
+cfit_test <- cv.glmnet(xdata_less[-itrain,], as.factor(ydata[-itrain]), family = "binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure = "auc", keep = TRUE)
+rocs <- roc.glmnet(cfit_test$fit.preval, newy = as.factor(ydata[-itrain]))
+best <- cfit_test$index["min",]
+plot(rocs[[best]], type = "l")
+invisible(sapply(rocs, lines, col="grey"))
+lines(rocs[[best]], lwd = 2,col = "red")
+```
+
