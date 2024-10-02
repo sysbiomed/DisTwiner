@@ -48,15 +48,15 @@ draw_confusion_matrix <- function(cm) {
 
   # create the matrix 
   rect(150, 430, 240, 370, col='#3F97D0')
-  text(195, 435, 'i', cex=3)
+  text(195, 435, '0', cex=3)
   rect(250, 430, 340, 370, col='#F7AD50')
-  text(295, 435, 'ii', cex=3)
+  text(295, 435, '1', cex=3)
   text(125, 370, 'Predicted', cex=3, srt=90, font=2)
   text(245, 450, 'Actual', cex=3, font=2)
   rect(150, 305, 240, 365, col='#F7AD50')
   rect(250, 305, 340, 365, col='#3F97D0')
-  text(140, 400, 'i', cex=3, srt=90)
-  text(140, 335, 'ii', cex=3, srt=90)
+  text(140, 400, '0', cex=3, srt=90)
+  text(140, 335, '1', cex=3, srt=90)
 
   # add in the cm results 
   res <- as.numeric(cm$table)
@@ -863,7 +863,7 @@ saveRDS(roc, paste0("model_evaluation/roc/disTwiner_", model_type, "_roc.rds"))
 # Figure 2: Biological data set
 
 ```{r load immune data}
-srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+srt.immune <- readRDS("G:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
   subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
 
 xdata <- t(as.matrix(GetAssayData(srt.immune, "data")))
@@ -943,7 +943,7 @@ data.frame(weight = ang_weight) %>%
     theme(plot.title = element_text(size=15), axis.title.x = element_text(size = 15),
           axis.title.y.left = element_text(size = 30), axis.title.x.bottom = element_text(size = 30),
           axis.text.x.bottom = element_text(size = 30), axis.text.y.left = element_text(size = 30)) +
-    xlim(c(0,1)) + 
+    #xlim(c(0,1)) + 
     xlab("Feature weight") + 
     ylab("Count")
 dev.off()
@@ -999,7 +999,7 @@ saveRDS(var_selected, paste0("selected_features/", model_type, "_features.rds"))
 ```
 
 ```{r evaluate SVM performance}
-srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+srt.immune <- readRDS("G:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
   subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
 
 xdata <- t(as.matrix(GetAssayData(srt.immune, "data")))
@@ -1061,12 +1061,406 @@ yprobabilities <- predict(classifier, newdata = test_set[-101], type = "prob", p
 yprobabilities <- attr(yprobabilities,"probabilities")[,2]
 roc <- roc(ydata[-itrain], yprobabilities)
 saveRDS(roc, paste0("real_data_evaluation/roc/", model_type, "_roc.rds"))
-
-# var_selected_idx <- which(fit_EN_cv_oldyg$glmnet.fit$beta[,which(fit_EN_cv_oldyg$cvm == min(fit_EN_cv_oldyg$cvm))] != 0)
-# var_selected <- colnames(xdata)[var_selected_idx]
-# saveRDS(var_selected, paste0("selected_features/", model_type, "_features.rds"))
 ```
 
+```{r evaluate Random Forest performance}
+model_type <- "randomForest_macs"
+classifier <- readRDS(paste0("models/", model_type, ".rds"))
+
+y_pred <- classifier$test$predicted
+
+# Accuracy and confusion matrix
+xtab <- table(y_pred, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("real_data_evaluation/confusion_matrix/", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("real_data_evaluation/confusion_matrix/", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(y_pred)-1)
+saveRDS(precision, paste0("real_data_evaluation/precision/", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(y_pred)-1)
+saveRDS(recall, paste0("real_data_evaluation/recall/", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(y_pred)-1)
+saveRDS(f1, paste0("real_data_evaluation/f1/", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- classifier$test$votes
+yprobabilities <- yprobabilities[,2]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("real_data_evaluation/roc/", model_type, "_roc.rds"))
+```
+
+```{r evaluate logReg performance}
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+  subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
+
+xdata <- t(as.matrix(GetAssayData(srt.immune, "data")))
+
+xdata <- xdata[,sapply(seq(ncol(xdata)), function(ix) {sd(xdata[,ix])}) != 0]
+
+ydata <- c(rep(0, length(srt.immune$Condition)))
+for (i in 1:length(srt.immune$Condition)) {
+  ydata[i] <- 0*(unname(srt.immune$Condition)[i] == "Young") + 1*(unname(srt.immune$Condition)[i] == "Old")
+}
+
+ydata <- as.numeric(ydata)
+
+ylabel <- as.character(unname(srt.immune$cell_label))
+
+rm(srt.immune)
+
+model_type <- "logReg_macs"
+fit_EN_cv_oldyg <- cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, paste0("models/", model_type, ".rds"))
+
+ypredictions <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(ypredictions, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0("real_data_evaluation/confusion_matrix/", model_type, "_cmPlot.pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0("real_data_evaluation/confusion_matrix/", model_type, "_cm.rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(ypredictions))
+saveRDS(precision, paste0("real_data_evaluation/precision/", model_type, "_precision.rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(recall, paste0("real_data_evaluation/recall/", model_type, "_recall.rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(ypredictions))
+saveRDS(f1, paste0("real_data_evaluation/f1/", model_type, "_f1.rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "response")[,1]
+roc <- roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0("real_data_evaluation/roc/", model_type, "_roc.rds"))
+
+var_selected_idx <- which(fit_EN_cv_oldyg$glmnet.fit$beta[,which(fit_EN_cv_oldyg$cvm == min(fit_EN_cv_oldyg$cvm))] != 0)
+var_selected <- colnames(xdata)[var_selected_idx]
+saveRDS(var_selected, paste0("selected_features/", model_type, "_features.rds"))
+```
+
+```{r features selected by DGEA}
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+  subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
+
+Idents(srt.immune) <- 'Condition'
+
+model_type <- 'DGEA_macs'
+
+features <- FindMarkers(srt.immune,
+                        ident.1 = 'Old', 
+                        ident.2 = 'Young',
+                        assay = 'RNA',
+                        logfc.threshold = 0.025,
+                        test.use = 'MAST'
+                        )
+
+saveRDS(features, paste0("selected_features/", model_type, "_features.rds"))
+```
+
+```{r venn diagram of selected features for each model}
+features_disTwiner <- readRDS("selected_features/disTwiner_macs_features.rds")
+features_logReg <- readRDS("selected_features/logReg_macs_features.rds")
+features_DGEA <- rownames(readRDS("selected_features/DGEA_macs_features.rds"))
+
+# install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# List of items
+x <- list(DisTwiner = features_disTwiner, LogReg = features_logReg, MAST = features_DGEA)
+
+# 3D Venn diagram
+pdf("selected_features/feature_selection_venn.pdf")
+ggVennDiagram(x)
+dev.off()
+```
+
+```{r gsea - distwiner features}
+model_type <- "disTwiner_macs"
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+  subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
+
+genes_selected <- readRDS("selected_features/disTwiner_macs_features.rds")
+
+library(msigdbr)
+
+### HALLMARK
+
+gene_sets = msigdbr(species = "mouse", category = "H")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+Idents(srt.immune) <- 'Condition'
+
+markers <- FoldChange(srt.immune,
+                      ident.1 = 'Old', 
+                      ident.2 = 'Young',
+                      assay = 'RNA',
+                      features = genes_selected
+                      )
+
+ranks <- markers$avg_log2FC
+names(ranks) <- rownames(markers)
+
+fgseaRes <- fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+pdf(paste0("selected_features/feature_selection_", model_type,"_pathwaysHallmarkPlot.pdf"))
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+dev.off()
+
+saveRDS(fgseaResTidy, paste0("selected_features/", model_type, "_pathwaysHallmark.rds"))
+
+### REACTOME
+
+gene_sets = msigdbr(species = "mouse", category = "C2", subcategory = "CP:REACTOME")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+fgseaRes <- fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1.5), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+
+saveRDS(fgseaResTidy, paste0("selected_features/", model_type, "_pathwaysReactome.rds"))
+```
+
+```{r gsea - logReg features}
+model_type <- "logReg_macs"
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+  subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
+
+genes_selected <- readRDS("selected_features/logReg_macs_features.rds")
+
+library(msigdbr)
+
+gene_sets = msigdbr(species = "mouse", category = "H")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+Idents(srt.immune) <- 'Condition'
+
+markers <- FoldChange(srt.immune,
+                      ident.1 = 'Old', 
+                      ident.2 = 'Young',
+                      assay = 'RNA',
+                      features = genes_selected
+                      )
+
+ranks <- markers$avg_log2FC
+names(ranks) <- rownames(markers)
+
+fgseaRes <- fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+pdf(paste0("selected_features/feature_selection_", model_type,"_pathwaysHallmarkPlot.pdf"))
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+dev.off()
+
+saveRDS(fgseaResTidy, paste0("selected_features/", model_type, "_pathwaysHallmark.rds"))
+
+### REACTOME
+
+gene_sets = msigdbr(species = "mouse", category = "C2", subcategory = "CP:REACTOME")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+fgseaRes <- fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1.5), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+
+saveRDS(fgseaResTidy, paste0("selected_features/", model_type, "_pathwaysReactome.rds"))
+```
+
+```{r gsea - DGEA features}
+model_type <- "DGEA_macs"
+srt.immune <- readRDS("E:/Storage/rna_seq_datasets/immune_seurat_norm_annotated.rds") %>%
+  subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
+
+genes_selected <- rownames(readRDS("selected_features/DGEA_macs_features.rds"))
+
+library(msigdbr)
+
+gene_sets = msigdbr(species = "mouse", category = "H")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+Idents(srt.immune) <- 'Condition'
+
+markers <- FoldChange(srt.immune,
+                      ident.1 = 'Old', 
+                      ident.2 = 'Young',
+                      assay = 'RNA',
+                      features = genes_selected
+                      )
+
+ranks <- markers$avg_log2FC
+names(ranks) <- rownames(markers)
+
+fgseaRes <- fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+pdf(paste0("selected_features/feature_selection_", model_type,"_pathwaysHallmarkPlot.pdf"))
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+dev.off()
+
+saveRDS(fgseaResTidy, paste0("selected_features/", model_type, "_pathwaysHallmark.rds"))
+
+### REACTOME
+
+gene_sets = msigdbr(species = "mouse", category = "C2", subcategory = "CP:REACTOME")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+fgseaRes <- fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1.5), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+
+saveRDS(fgseaResTidy, paste0("selected_features/", model_type, "_pathwaysReactome.rds"))
+```
+
+```{r venn diagram of all pathways detected by each classifier}
+### HALLMARK
+
+pathways_disTwiner <- readRDS("selected_features/disTwiner_macs_pathwaysHallmark.rds")$pathway
+pathways_logReg <- readRDS("selected_features/logReg_macs_pathwaysHallmark.rds")$pathway
+pathways_DGEA <- readRDS("selected_features/DGEA_macs_pathwaysHallmark.rds")$pathway
+
+# install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# List of items
+x <- list(DisTwiner = pathways_disTwiner, LogReg = pathways_logReg, MAST = pathways_DGEA)
+
+# 3D Venn diagram
+pdf("selected_features/feature_selection_pathwayHallmarkVenn.pdf")
+ggVennDiagram(x)
+dev.off()
+
+### REACTOME
+
+pathways_disTwiner <- readRDS("selected_features/disTwiner_macs_pathwaysReactome.rds")$pathway
+pathways_logReg <- readRDS("selected_features/logReg_macs_pathwaysReactome.rds")$pathway
+pathways_DGEA <- readRDS("selected_features/DGEA_macs_pathwaysReactome.rds")$pathway
+
+# install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# List of items
+x <- list(DisTwiner = pathways_disTwiner, LogReg = pathways_logReg, MAST = pathways_DGEA)
+
+# 3D Venn diagram
+pdf("selected_features/feature_selection_pathwayReactomeVenn.pdf")
+ggVennDiagram(x)
+dev.off()
+```
 
 ```{r assess if identified features are differentially expressed with age in the macrophage populations}
 # macs_fit <- cv.glmnet(xdata, as.factor(ydata), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
