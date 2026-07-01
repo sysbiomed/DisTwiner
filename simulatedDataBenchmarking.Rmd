@@ -1,0 +1,375 @@
+---
+title: "Twinner analysis to identify features distinguishing macrophage groups - Part 1"
+author:
+  - Tiago M. Costa^[GIMM/FMUL, tiago.costa@gimm.pt]
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+params:
+  seed: 1234
+  BASE_DIR: "D:/ATR_bioinformatics/analysis/DisTwiner/simulatedDataBenchmarking"
+
+---
+
+```{r function to create definitive positive matrix and cm, include=FALSE}
+def_pos_mat <- function(num) {
+  A <- matrix(runif(num^2)*2-1, ncol=num) 
+  return (t(A) %*% A)
+}
+
+draw_confusion_matrix <- function(cm) {
+  
+  #layout(matrix(c(1,1,2)))
+  par(mar=c(2,2,2,2))
+  plot(c(100, 345), c(300, 450), type = "n", xlab="", ylab="", xaxt='n', yaxt='n')
+  
+  # create the matrix 
+  rect(150, 430, 240, 370, col='#3F97D0')
+  text(195, 435, '0', cex=3)
+  rect(250, 430, 340, 370, col='#F7AD50')
+  text(295, 435, '1', cex=3)
+  text(125, 370, 'Predicted', cex=3, srt=90, font=2)
+  text(245, 450, 'Actual', cex=3, font=2)
+  rect(150, 305, 240, 365, col='#F7AD50')
+  rect(250, 305, 340, 365, col='#3F97D0')
+  text(140, 400, '0', cex=3, srt=90)
+  text(140, 335, '1', cex=3, srt=90)
+  
+  # add in the cm results 
+  res <- as.numeric(cm$table)
+  text(195, 400, res[1], cex=4, font=2, col='white')
+  text(195, 335, res[2], cex=4, font=2, col='white')
+  text(295, 400, res[3], cex=4, font=2, col='white')
+  text(295, 335, res[4], cex=4, font=2, col='white')
+}  
+```
+
+```{r create synthetic data, include=FALSE}
+# https://www.r-bloggers.com/2016/02/generating-and-visualizing-multivariate-data-with-r/
+
+library(MASS)
+set.seed(params$seed)
+n_feats <- 100
+
+# Mean
+mu_a_yg <- runif(n = n_feats, min = 1, max = 50)
+mu_b_yg <- mu_a_yg/3
+mu_c_yg <- rnorm(n = n_feats)
+
+mu_a_old <- runif(n = n_feats, min = 1, max = 50)
+mu_b_old <- mu_a_old/2
+mu_c_old <- rnorm(n = n_feats)
+# Covariance matrix
+sigma_a_yg <- def_pos_mat(n_feats)  
+sigma_b_yg <- sigma_a_yg/3  
+sigma_c_yg <- def_pos_mat(n_feats)   
+
+sigma_a_old <- def_pos_mat(n_feats)
+sigma_b_old <- sigma_a_old/2
+sigma_c_old <- def_pos_mat(n_feats)  
+
+# Generate sample from N(mu, Sigma)
+bivn_a_yg <- mvrnorm(2000, mu = mu_a_yg, Sigma = sigma_a_yg )
+bivn_b_yg <- mvrnorm(1000, mu = mu_b_yg, Sigma = sigma_b_yg )
+bivn_c_yg <- mvrnorm(2000, mu = mu_c_yg, Sigma = sigma_c_yg )
+
+bivn_a_old <- mvrnorm(1500, mu = mu_a_old, Sigma = sigma_a_old )
+bivn_b_old <- mvrnorm(2000, mu = mu_b_old, Sigma = sigma_b_old )
+bivn_c_old <- mvrnorm(1000, mu = mu_c_old, Sigma = sigma_c_old )
+
+y_a <- c(rep(0, 2000), rep(1, 1500))
+y_b <- c(rep(0, 1000), rep(1, 2000))
+y_c <- c(rep(0, 2000), rep(1, 1000))
+
+x_a <- rbind(bivn_a_yg, bivn_a_old)
+x_b <- rbind(bivn_b_yg, bivn_b_old)
+x_c <- rbind(bivn_c_yg, bivn_c_old)
+
+xdata <- scale(rbind(x_a, x_b, x_c))
+ydata <- c(y_a, y_b, y_c)
+ylabel <- c(rep("a",length(y_a)), rep("b",length(y_b)), rep("c", length(y_c)))
+
+feature_cols <- which(!colnames(dataset) %in% "ydata")
+
+rm(y_a, y_b, y_c, bivn_a_yg, bivn_b_yg, bivn_c_yg, bivn_a_old, 
+   bivn_b_old, bivn_c_old, sigma_a_yg, sigma_b_yg, sigma_c_yg, sigma_a_old,
+   sigma_b_old, sigma_c_old, mu_a_yg, mu_b_yg, mu_c_yg, mu_a_old, mu_b_old,
+   mu_c_old)
+
+data <- data.frame(xdata, y = ydata, label = ylabel)
+```
+
+```{r split data and build correlation matrices, include=FALSE}
+#Define train and test data
+itrain <- sort(sample(nrow(xdata), nrow(xdata)*.9))
+
+# this part should receive an arbitrary number of matrices
+groups <- unique(data[,'label'])
+group_list <- list()
+
+for (i in 1:length(groups)) {
+  group_list[[i]] <- data[which(data[,'label'] == groups[i]),!colnames(data) %in% c("y", "label")]
+}
+
+# normalizing data
+group_list <- lapply(group_list, scale)
+
+## correlation matrices
+group_cor <- lapply(group_list, function (x) propagate::bigcor(x, y = NULL, fun = "cor", size = 2000, verbose=FALSE))
+group_cor <- lapply(group_cor, function (x) as.data.frame(ff::as.ffdf(x)))
+```
+
+```{r distwiner benchmarking helper functions}
+compute_twiner_weights <- function(group_cor, n_feats, transform_fn, aggregate_fn) {
+  group_combs <- combn(length(group_cor), 2)
+  n_pairs     <- ncol(group_combs)
+  weight_mat  <- matrix(0, nrow = n_pairs, ncol = n_feats)
+  
+  for (i in seq_len(n_feats)) {
+    for (k in seq_len(n_pairs)) {
+      raw <- lsa::cosine(
+        group_cor[[ group_combs[1, k] ]][, i],
+        group_cor[[ group_combs[2, k] ]][, i]
+      )
+      weight_mat[k, i] <- transform_fn(raw)
+    }
+  }
+  apply(weight_mat, 2, aggregate_fn)
+}
+
+evaluate_and_save <- function(model, fit, xdata, ydata, itrain, ang_weight, base_dir,
+                              pred_fn = function(f) predict(f, newx = xdata[-itrain,], type = "class"),
+                              prob_fn = function(f) predict(f, newx = xdata[-itrain,], type = "response")[, 1]) {
+  ypred  <- pred_fn(fit)
+  ytest  <- ydata[-itrain]
+  
+  # Confusion matrix
+  cm <- caret::confusionMatrix(table(ypred, ytest))
+  pdf(file.path(base_dir, "performance", "confusionMatrix", paste0(model, ".pdf")))
+  draw_confusion_matrix(cm)
+  dev.off()
+  saveRDS(cm, file.path(base_dir, "performance", "confusionMatrix", paste0(model, ".rds")))
+  
+  # Metrics
+  yprob <- prob_fn(fit)
+  metrics <- list(
+    precision = Metrics::precision(ytest, as.numeric(ypred)),
+    recall    = Metrics::recall(ytest, as.numeric(ypred)),
+    f1        = Metrics::f1(ytest, as.numeric(ypred)),
+    roc       = pROC::roc(ytest, yprob),
+    weight_sd = if (!is.null(ang_weight)) sd(ang_weight) else NA
+  )
+  for (nm in names(metrics)) {
+    saveRDS(metrics[[nm]], file.path(base_dir, "performance", nm, paste0(model, ".rds")))
+  }
+  invisible(metrics)
+}
+```
+
+```{r distwiner variants benchmark}
+linear_dissim <- function(raw) 1 - acos(raw) / pi
+
+model_configs <- list(
+  list(name = "mean-linear",    transform = linear_dissim, aggregate = mean),
+  list(name = "maximum-linear", transform = linear_dissim, aggregate = max),
+  list(name = "minimum-linear", transform = linear_dissim, aggregate = min),
+  list(name = "maxMean-linear", transform = linear_dissim,
+       aggregate = function(x) mean(x[x >= quantile(x, 0.9, na.rm = TRUE)])),
+  list(name = "minMean-linear", transform = linear_dissim,
+       aggregate = function(x) mean(x[x <= quantile(x, 0.1, na.rm = TRUE)])),
+  list(name = "minimum-exp",    transform = function(r) exp(linear_dissim(r)), aggregate = min),
+  list(name = "minimum-sig",    transform = function(r) 1 / (1 + exp(-linear_dissim(r))), aggregate = min)
+)
+
+for (cfg in model_configs) {
+  ang_weight <- compute_twiner_weights(group_cor, n_feats, cfg$transform, cfg$aggregate)
+  
+  # Weight distribution plot
+  p <- ggplot(data.frame(weight = ang_weight), aes(x = weight)) + ...
+  ggsave(file.path(params$BASE_DIR, "featureWeight", paste0(cfg$name, ".pdf")), p, width = 9)
+  
+  fit <- glmnet::cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]),
+                           family = "binomial", nfolds = 10, alpha = 0.9,
+                           penalty.factor = ang_weight, type.measure = "mse")
+  saveRDS(fit, file.path(params$BASE_DIR, "trainedModels", paste0(cfg$name, ".rds")))
+  
+  evaluate_and_save(cfg$name, fit, xdata, ydata, itrain, ang_weight, BASE_DIR)
+}
+```
+
+```{r performance - svm}
+library(dplyr)
+library(ggplot2)
+
+#Train model and save
+model <- "svm"
+
+dataset <- data.frame(cbind(xdata, ydata))
+dataset$ydata <- factor(dataset$ydata, levels = c(0, 1)) 
+
+training_set = dataset[itrain,]
+test_set = dataset[-itrain,]
+
+training_set[,feature_cols] = scale(training_set[,feature_cols]) 
+test_set[,feature_cols] = scale(test_set[,feature_cols]) 
+
+classifier = e1071::svm(formula = ydata ~ ., 
+                        data = training_set, 
+                        type = 'C-classification', 
+                        kernel = 'linear', probability = TRUE)
+
+saveRDS(classifier, paste0(params$BASE_DIR, "/trainedModels/", 
+                           model, 
+                           ".rds"))
+
+y_pred = predict(classifier, newdata = test_set[,feature_cols]) 
+
+# Accuracy and confusion matrix
+xtab <- table(y_pred, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0(params$BASE_DIR, "/performance/confusionMatrix/", 
+           model, 
+           ".pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0(params$BASE_DIR, "/performance/confusionMatrix/", 
+                   model, 
+                   ".rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(y_pred))
+saveRDS(precision, paste0(params$BASE_DIR, "/performance/precision/", 
+                          model, 
+                          ".rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(recall, paste0(params$BASE_DIR, "/performance/recall/", 
+                       model, 
+                       ".rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(f1, paste0(params$BASE_DIR, "/performance/f1Score/", 
+                   model, 
+                   ".rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(classifier, newdata = test_set[feature_cols], type = "prob", probability = TRUE)
+yprobabilities <- attr(yprobabilities,"probabilities")[,2]
+roc <- pROC::roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0(params$BASE_DIR, "/performance/rocAUC/", 
+                    model, 
+                    ".rds"))
+```
+
+```{r performance - random forest}
+library(dplyr)
+library(ggplot2)
+
+#Train model and save
+model <- "randomForest"
+
+xtrain <- xdata[itrain,]
+xtest <- xdata[-itrain,]
+ytrain <- as.factor(ydata[itrain])
+ytest <- as.factor(ydata[-itrain])
+
+rf <- randomForest::randomForest(x = xtrain, y = ytrain, xtest = xtest, ytest = ytest)
+
+saveRDS(rf, paste0(params$BASE_DIR, "/trainedModels/", 
+                   model, 
+                   ".rds"))
+
+y_pred = rf$test$predicted 
+
+# Accuracy and confusion matrix
+xtab <- table(y_pred, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0(params$BASE_DIR, "/performance/confusionMatrix/", 
+           model, 
+           ".pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0(params$BASE_DIR, "/performance/confusionMatrix/", 
+                   model, 
+                   ".rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(y_pred))
+saveRDS(precision, paste0(params$BASE_DIR, "/performance/precision/", 
+                          model, 
+                          ".rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(recall, paste0(params$BASE_DIR, "/performance/recall/", 
+                       model, 
+                       ".rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(f1, paste0(params$BASE_DIR, "/performance/f1Score/", 
+                   model, 
+                   ".rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(rf, xtest, type="prob")
+roc <- pROC::roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0(params$BASE_DIR, "/performance/rocAUC/", 
+                    model, 
+                    ".rds"))
+```
+
+```{r performance - elastic net}
+#Train model and save
+model <- "elasticNet"
+
+fit_EN_cv_oldyg <- glmnet::cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, paste0(params$BASE_DIR, "/trainedModels/", 
+                                model, 
+                                ".rds"))
+
+y_pred <- predict(fit_EN_cv_oldyg, newx = xdata[-itrain,], type = "class")
+
+# Accuracy and confusion matrix
+xtab <- table(y_pred, ydata[-itrain])
+cm <- caret::confusionMatrix(xtab)
+cm
+pdf(paste0(params$BASE_DIR, "/performance/confusionMatrix/", 
+           model, 
+           ".pdf"))
+draw_confusion_matrix(cm)
+dev.off()
+saveRDS(cm, paste0(params$BASE_DIR, "/performance/confusionMatrix/", 
+                   model, 
+                   ".rds"))
+
+# Precision
+precision <- Metrics::precision(ydata[-itrain], as.numeric(y_pred))
+saveRDS(precision, paste0(params$BASE_DIR, "/performance/precision/", 
+                          model, 
+                          ".rds"))
+
+# Recall
+recall <- Metrics::recall(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(recall, paste0(params$BASE_DIR, "/performance/recall/", 
+                       model, 
+                       ".rds"))
+
+#F1 Score
+f1 <- Metrics::f1(actual = ydata[-itrain], predicted = as.numeric(y_pred))
+saveRDS(f1, paste0(params$BASE_DIR, "/performance/f1Score/", 
+                   model, 
+                   ".rds"))
+
+#ROC Curve AUC
+yprobabilities <- predict(fit_EN_cv_oldyg, newdata = test_set[feature_cols], type = "response", probability = TRUE)
+yprobabilities <- attr(yprobabilities,"probabilities")[,2]
+roc <- pROC::roc(ydata[-itrain], yprobabilities)
+saveRDS(roc, paste0(params$BASE_DIR, "/performance/rocAUC/", 
+                    model, 
+                    ".rds"))
+```

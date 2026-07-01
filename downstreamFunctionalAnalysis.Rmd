@@ -1,0 +1,460 @@
+---
+title: "Twinner analysis to identify features distinguishing macrophage groups - Part 3"
+author:
+  - Tiago M. Costa^[GIMM/FMUL, tiago.costa@gimm.pt]
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+params:
+  seed: 1234
+---
+
+```{r load data}
+library(dplyr)
+
+srt <- readRDS("D:/ATR_bioinformatics/processed_data/Seurat/ImmuneAging.rds") %>%
+  subset(subset = cell_label %in% c("lateMacs", "repMacs", "intMacs", "regMacs 1", "regMacs 2", "infMacs"))
+```
+
+```{r features selected by differential gene expression testing}
+Seurat::Idents(srt) <- 'Condition'
+
+model <- 'MAST'
+
+features <- Seurat::FindMarkers(srt,
+                        ident.1 = 'Old', 
+                        ident.2 = 'Young',
+                        assay = 'RNA',
+                        logfc.threshold = 0.3,
+                        test.use = 'MAST'
+                        )
+
+var_selected <- rownames(features)
+
+saveRDS(var_selected, paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/selectedFeatures/", 
+           model, 
+           ".rds"))
+```
+
+```{r venn diagram of selected features for each model}
+features_disTwiner <- readRDS("D:/ATR_bioinformatics/analysis/DisTwiner/realDataBenchmarking/selectedFeatures/distwiner.rds")
+features_EN <- readRDS("D:/ATR_bioinformatics/analysis/DisTwiner/realDataBenchmarking/selectedFeatures/elasticNet.rds")
+features_MAST <- readRDS("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/selectedFeatures/MAST.rds")
+
+# install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# List of items
+x <- list(DisTwiner = features_disTwiner, ElasticNet = features_EN, MAST = features_MAST)
+
+# 3D Venn diagram
+pdf("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/selectedFeatures/feature_selection_venn.pdf")
+ggVennDiagram(x)
+dev.off()
+```
+
+```{r gsea - distwiner features}
+model <- "disTwiner"
+
+genes_selected <- features_disTwiner
+
+library(msigdbr)
+
+### HALLMARK
+
+gene_sets = msigdbr::msigdbr(species = "mouse", category = "H")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+Seurat::Idents(srt) <- 'Condition'
+
+markers <- Seurat::FoldChange(srt,
+                      ident.1 = 'Old', 
+                      ident.2 = 'Young',
+                      assay = 'RNA',
+                      features = genes_selected
+                      )
+
+ranks <- markers$avg_log2FC
+names(ranks) <- rownames(markers)
+
+fgseaRes <- fgsea::fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+library(ggplot2)
+
+pdf(paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model,"_Hallmark.pdf"))
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+dev.off()
+
+saveRDS(fgseaResTidy, (paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model, "_HallmarkPathways.rds")))
+```
+
+```{r gsea - elastic net features}
+model <- "elasticNet"
+
+genes_selected <- features_EN
+
+library(msigdbr)
+
+### HALLMARK
+
+gene_sets = msigdbr::msigdbr(species = "mouse", category = "H")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+Seurat::Idents(srt) <- 'Condition'
+
+markers <- Seurat::FoldChange(srt,
+                      ident.1 = 'Old', 
+                      ident.2 = 'Young',
+                      assay = 'RNA',
+                      features = genes_selected
+                      )
+
+ranks <- markers$avg_log2FC
+names(ranks) <- rownames(markers)
+
+fgseaRes <- fgsea::fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+library(ggplot2)
+
+pdf(paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model,"_Hallmark.pdf"))
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+dev.off()
+
+saveRDS(fgseaResTidy, (paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model, "_HallmarkPathways.rds")))
+```
+
+```{r gsea - MAST features}
+model <- "MAST"
+
+genes_selected <- features_MAST
+
+library(msigdbr)
+
+### HALLMARK
+
+gene_sets = msigdbr::msigdbr(species = "mouse", category = "H")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+Seurat::Idents(srt) <- 'Condition'
+
+markers <- Seurat::FoldChange(srt,
+                      ident.1 = 'Old', 
+                      ident.2 = 'Young',
+                      assay = 'RNA',
+                      features = genes_selected
+                      )
+
+ranks <- markers$avg_log2FC
+names(ranks) <- rownames(markers)
+
+fgseaRes <- fgsea::fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+library(ggplot2)
+
+pdf(paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model,"_Hallmark.pdf"))
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+dev.off()
+
+saveRDS(fgseaResTidy, (paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model, "_HallmarkPathways.rds")))
+```
+
+```{r venn diagram of hallmark pathways for each model}
+pathways_disTwiner <- readRDS("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/distwiner_HallmarkPathways.rds")
+pathways_EN <- readRDS("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/elasticNet_HallmarkPathways.rds")
+pathways_MAST <- readRDS("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/MAST_HallmarkPathways.rds")
+
+# install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# List of items
+x <- list(DisTwiner = pathways_disTwiner$pathway, ElasticNet = pathways_EN$pathway, MAST = pathways_MAST$pathway)
+
+# 3D Venn diagram
+pdf("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/HallmarkPathways_venn.pdf")
+ggVennDiagram(x)
+dev.off()
+```
+
+```{r fit distwiner and elastic net based on genes pre-selected by MAST}
+srt_select <- srt[features_MAST,]
+```
+
+```{r prepare data for new fit}
+xdata <- t(as.matrix(Seurat::GetAssayData(srt_select, assay = "RNA", "data")))
+
+xdata <- xdata[,sapply(seq(ncol(xdata)), function(ix) {sd(xdata[,ix])}) != 0]
+
+ydata <- c(rep(0, length(srt_select$Condition)))
+for (i in 1:length(srt_select$Condition)) {
+  ydata[i] <- 0*(unname(srt_select$Condition)[i] == "Young") + 1*(unname(srt_select$Condition)[i] == "Old")
+}
+
+ydata <- as.numeric(ydata)
+
+ylabel <- as.character(unname(srt_select$cell_label))
+
+data <- data.frame(xdata, y = ydata, label = ylabel)
+
+rm(srt_select)
+
+itrain <- sort(sample(nrow(xdata), nrow(xdata)*.9))
+```
+
+```{r build correlation matrices for new fit}
+library(dplyr)
+library(tidyr)
+
+# this part should receive an arbitrary number of matrices
+groups <- unique(data[,'label'])
+group_list <- list()
+
+for (i in 1:length(groups)) {
+  group_list[[i]] <- data[which(data[,'label'] == groups[i]),!colnames(data) %in% c("y", "label")]
+}
+
+# filter genes with no sample variability
+for (i in 1:length(groups)) {
+  group_list[[i]] <- group_list[[i]][,sapply(seq(ncol(group_list[[i]])), function(ix) {sd(group_list[[i]][,ix])}) != 0]
+}
+
+# select only common genes between groups
+col_common = colnames(xdata)
+for (i in 1:length(group_list)){
+  col_common = intersect(col_common, colnames(group_list[[i]]))
+}
+
+group_list <- lapply(group_list, function(x) x[, col_common])
+
+xdata <- scale(xdata[, col_common])
+
+# normalizing data
+group_list <- lapply(group_list, scale)
+
+## correlation matrices
+group_cor <- lapply(group_list, function (x) propagate::bigcor(x, y = NULL, fun = "cor", size = 2000, verbose=FALSE))
+group_cor <- lapply(group_cor, function (x) as.data.frame(ff::as.ffdf(x)))
+group_cor <- lapply(group_cor, function (x) x %>% mutate(across(everything(), replace_na, 0)))
+# group_cor <- readRDS("group_correlation_mat_macs.rds")
+```
+
+```{r MAST + distwiner features}
+library(dplyr)
+library(ggplot2)
+
+model = "MAST_distwiner"
+group_combs <- combn(length(group_cor),2)
+n_feats <- dim(xdata)[2]
+ang_weight_mat = matrix(0, nrow = dim(group_combs)[2], ncol = n_feats) 
+for (i in 1:n_feats){
+  for (k in 1:dim(group_combs)[2]) {
+    ang_weight_mat[k,i] <- exp(1 - acos(lsa::cosine(group_cor[[group_combs[1,k]]][,i],group_cor[[group_combs[2,k]]][,i]))/pi)
+  }
+}
+
+ang_weight_mat[is.na(ang_weight_mat)] <- 0
+
+ang_weight <- apply(ang_weight_mat, 2, function(x) min(x[x > 0])) 
+
+rm(group_cor, group_list, group_combs, data, ang_weight_mat)
+gc()
+
+#Train model and save
+fit_EN_cv_oldyg <- glmnet::cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, penalty.factor=ang_weight, type.measure="mse")
+
+saveRDS(fit_EN_cv_oldyg, paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/trainedModels/", 
+           model, 
+           ".rds"))
+
+#selected features
+var_selected_idx <- which(fit_EN_cv_oldyg$glmnet.fit$beta[,which(fit_EN_cv_oldyg$cvm == min(fit_EN_cv_oldyg$cvm))] != 0)
+var_selected <- colnames(xdata)[var_selected_idx]
+saveRDS(var_selected, paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/selectedFeatures/", 
+           model, 
+           ".rds"))
+```
+
+```{r elastic net performance}
+model = "MAST_elasticNet"
+
+fit_EN_cv_oldyg <- glmnet::cv.glmnet(xdata[itrain,], as.factor(ydata[itrain]), family="binomial", nfolds=10, alpha=0.9, type.measure="mse")
+saveRDS(fit_EN_cv_oldyg, paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/trainedModels/", 
+                           model, 
+                           ".rds"))
+
+#selected features
+var_selected_idx <- which(fit_EN_cv_oldyg$glmnet.fit$beta[,which(fit_EN_cv_oldyg$cvm == min(fit_EN_cv_oldyg$cvm))] != 0)
+var_selected <- colnames(xdata)[var_selected_idx]
+saveRDS(var_selected, paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/selectedFeatures/", 
+           model, 
+           ".rds"))
+```
+
+```{r venn diagram of selected features for each model after MAST pre-selection}
+features_MAST_disTwiner <- readRDS("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/selectedFeatures/MAST_distwiner.rds")
+features_MAST_EN <- readRDS("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/selectedFeatures/MAST_elasticNet.rds")
+
+# install.packages("ggVennDiagram")
+library(ggVennDiagram)
+
+# List of items
+x <- list(DisTwiner = features_MAST_disTwiner, ElasticNet = features_MAST_EN)
+
+# 3D Venn diagram
+pdf("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/selectedFeatures/feature_selection_venn_preSelectionMAST.pdf")
+ggVennDiagram(x)
+dev.off()
+```
+
+```{r gsea - MAST + distwiner features}
+model <- "MAST_disTwiner"
+
+genes_selected <- features_MAST_disTwiner
+
+library(msigdbr)
+
+### HALLMARK
+
+gene_sets = msigdbr::msigdbr(species = "mouse", category = "H")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+Seurat::Idents(srt) <- 'Condition'
+
+markers <- Seurat::FoldChange(srt,
+                      ident.1 = 'Old', 
+                      ident.2 = 'Young',
+                      assay = 'RNA',
+                      features = genes_selected
+                      )
+
+ranks <- markers$avg_log2FC
+names(ranks) <- rownames(markers)
+
+fgseaRes <- fgsea::fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+library(ggplot2)
+
+pdf(paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model,"_Hallmark.pdf"))
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+dev.off()
+
+saveRDS(fgseaResTidy, (paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model, "_HallmarkPathways.rds")))
+```
+
+```{r gsea - MAST + elastic net features}
+model <- "MAST_elasticNet"
+
+genes_selected <- features_MAST_EN
+
+library(msigdbr)
+
+### HALLMARK
+
+gene_sets = msigdbr::msigdbr(species = "mouse", category = "H")
+msigdbr_list = split(x = gene_sets$gene_symbol, f = gene_sets$gs_name)
+
+Seurat::Idents(srt) <- 'Condition'
+
+markers <- Seurat::FoldChange(srt,
+                      ident.1 = 'Old', 
+                      ident.2 = 'Young',
+                      assay = 'RNA',
+                      features = genes_selected
+                      )
+
+ranks <- markers$avg_log2FC
+names(ranks) <- rownames(markers)
+
+fgseaRes <- fgsea::fgsea(pathways = msigdbr_list,
+                  stats = ranks,
+                  minSize=10,
+                  maxSize=500,
+                  nproc=1,
+                  scoreType="std")
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+library(ggplot2)
+
+pdf(paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model,"_Hallmark.pdf"))
+ggplot(fgseaResTidy %>% dplyr::filter(abs(NES) > 1), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title=paste0(paste0("Old vs Young"))) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10))
+dev.off()
+
+saveRDS(fgseaResTidy, (paste0("D:/ATR_bioinformatics/analysis/DisTwiner/downstreamFunctionalAnalysis/GSEA/", model, "_HallmarkPathways.rds")))
+```

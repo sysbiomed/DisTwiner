@@ -1,0 +1,1206 @@
+---
+title: "Twinner analysis to identify features distinguishing macrophage groups - Part 2"
+author:
+  - Tiago M. Costa^[GIMM/FMUL, tiago.costa@gimm.pt]
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+params:
+  seed: 1234
+  base_dir: "D:/ATR_bioinformatics/analysis/DisTwiner/realDataBenchmarking"
+  dataset: "ImmuneAging"
+  project_dir: "D:/ATR_bioinformatics"
+  n_stability_folds: 20
+  mi_bins: 5
+---
+
+```{r setup}
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(glmnet)
+library(caret)
+library(Metrics)
+library(pROC)
+library(randomForest)
+library(e1071)
+library(propagate)
+library(ff)
+library(lsa)
+library(Seurat)
+library(hrbrthemes)
+
+set.seed(params$seed)
+```
+
+
+```{r function to create confusion matrix, include=FALSE}
+draw_confusion_matrix <- function(cm) {
+
+  #layout(matrix(c(1,1,2)))
+  par(mar=c(2,2,2,2))
+  plot(c(100, 345), c(300, 450), type = "n", xlab="", ylab="", xaxt='n', yaxt='n')
+
+  # create the matrix 
+  rect(150, 430, 240, 370, col='#3F97D0')
+  text(195, 435, '0', cex=3)
+  rect(250, 430, 340, 370, col='#F7AD50')
+  text(295, 435, '1', cex=3)
+  text(125, 370, 'Predicted', cex=3, srt=90, font=2)
+  text(245, 450, 'Actual', cex=3, font=2)
+  rect(150, 305, 240, 365, col='#F7AD50')
+  rect(250, 305, 340, 365, col='#3F97D0')
+  text(140, 400, '0', cex=3, srt=90)
+  text(140, 335, '1', cex=3, srt=90)
+
+  # add in the cm results 
+  res <- as.numeric(cm$table)
+  text(195, 400, res[1], cex=4, font=2, col='white')
+  text(195, 335, res[2], cex=4, font=2, col='white')
+  text(295, 400, res[3], cex=4, font=2, col='white')
+  text(295, 335, res[4], cex=4, font=2, col='white')
+}  
+```
+
+```{r function to estimate necessary number of PCs, include=FALSE}
+npcs <- function(
+    seu,
+    var.toal=0.95,
+    reduction="pca"
+){
+  if(is.null(seu@reductions[[reduction]])){
+    cat("Reduction", reduction, "not found!")
+    return(NULL)
+  }
+  
+  tmp.var <- (seu@reductions[[reduction]]@stdev)^2
+  var.cut <- var.toal*sum(tmp.var)
+  n.pcs=0
+  var.sum = 0
+  while(var.sum < var.cut){
+    n.pcs = n.pcs + 1
+    var.sum <- var.sum + tmp.var[n.pcs]
+  }
+  
+  return(n.pcs)
+}
+```
+
+```{r function to process srt after subset, include=FALSE}
+seuPreProcess <- function(srt, assay='RNA', n.pcs=100){
+  # NormalizeData(srt) |> FindVariableFeatures() |> ScaleData() |> RunPCA()
+  pca.name = paste0('pca_', assay)
+  pca.key = paste0(pca.name,'_')
+  umap.name = paste0('umap_', assay)
+  tsne.name = paste0('tsne_', assay)
+
+  srt = Seurat::NormalizeData(
+    srt
+  ) |> Seurat::FindVariableFeatures(
+    assay = assay,
+    selection.method = "vst",
+    nfeatures = 3000,
+    verbose = F
+  ) |> Seurat::ScaleData(
+    assay = assay
+  ) |> Seurat::RunPCA(
+    assay = assay,
+    reduction.name = pca.name,
+    reduction.key = pca.key,
+    verbose = F,
+    npcs = n.pcs
+  )
+  
+  #find pcs to use (custom function, see helper functions script for details)
+  n.pcs.use = npcs(srt, reduction = pca.name, var.toal = 0.9)
+  
+  # FindNeighbors |> RunUMAP, FindClusters
+  srt <- Seurat::FindNeighbors(
+    srt,
+    reduction = pca.name,
+    dims = 1:n.pcs.use,
+    force.recalc = TRUE,
+    verbose = FALSE
+  ) |> Seurat::RunUMAP(
+    reduction = pca.name,
+    dims = 1:n.pcs.use,
+    n.components = 3,
+    reduction.name=umap.name
+  ) |> Seurat::RunTSNE(
+    reduction = pca.name,
+    dims = 1:n.pcs.use,
+    dim.embed = 3,
+    reduction.name=tsne.name
+  )
+  
+  srt@reductions[[umap.name]]@misc$n.pcs.used <- n.pcs.use
+  srt@reductions[[tsne.name]]@misc$n.pcs.used <- n.pcs.use
+    
+  for (r in (res <- seq(0.1, 2, 0.1)))
+    srt <- Seurat::FindClusters(srt, resolution = r, random.seed = params$seed, verbose = FALSE)
+  
+  return(srt)
+}
+```
+
+```{r twiner-weights}
+# Computes per-feature DisTwiner angular-dissimilarity weights across all
+# pairwise group combinations.
+#
+# Arguments:
+#   group_cor    – list of per-group correlation matrices (data frames)
+#   n_feats      – number of features
+#   transform_fn – function applied element-wise to each raw cosine value
+#   aggregate_fn – function used to collapse the pair-wise vector per feature
+#                  (e.g. min, mean, max)
+#
+# Returns a numeric vector of length n_feats.
+compute_twiner_weights <- function(group_cor, n_feats,
+                                   transform_fn, aggregate_fn) {
+  group_combs <- combn(length(group_cor), 2)
+  n_pairs     <- ncol(group_combs)
+  weight_mat  <- matrix(0, nrow = n_pairs, ncol = n_feats)
+
+  for (i in seq_len(n_feats)) {
+    for (k in seq_len(n_pairs)) {
+      raw <- lsa::cosine(
+        group_cor[[ group_combs[1, k] ]][, i],
+        group_cor[[ group_combs[2, k] ]][, i]
+      )
+      weight_mat[k, i] <- transform_fn(raw)
+    }
+  }
+  weight_vec <- apply(weight_mat, 2, aggregate_fn)
+  weight_vec[is.na(weight_vec)] <- 0
+  return(weight_vec)
+}
+```
+
+```{r helper-evaluate-model, include=FALSE}
+# Evaluates a fitted binary classifier on the held-out test set.
+# Saves confusion matrix, precision, recall, F1, and ROC to disk.
+#
+# `ypred`  – predicted class labels (integer 0/1)
+# `yprob`  – predicted probability for class 1 (for ROC)
+# `ytest`  – true labels (integer 0/1)
+evaluate_model <- function(model_name, ypred, yprob, ytest, BASE_DIR) {
+  stopifnot(all(ypred %in% c(0, 1)), all(ytest %in% c(0, 1)))
+
+  # Confusion matrix
+  cm <- caret::confusionMatrix(table(ypred, ytest))
+  pdf_cm <- file.path(BASE_DIR, "performance", "confusionMatrix",
+                      paste0(model_name, ".pdf"))
+  pdf(pdf_cm)
+    draw_confusion_matrix(cm)
+  dev.off()
+  saveRDS(cm, sub("\\.pdf$", ".rds", pdf_cm))
+
+  # Scalar metrics
+  metrics <- list(
+    precision = Metrics::precision(ytest, ypred),
+    recall    = Metrics::recall(ytest, ypred),
+    f1Score   = Metrics::f1(ytest, ypred),
+    rocAUC    = pROC::roc(ytest, yprob, quiet = TRUE)
+  )
+  for (nm in names(metrics)) {
+    saveRDS(
+      metrics[[nm]],
+      file.path(BASE_DIR, "performance", nm, paste0(model_name, ".rds"))
+    )
+  }
+  invisible(metrics)
+}
+```
+
+```{r helper-get-selected-features, include=FALSE}
+# Extracts the names of non-zero-coefficient features at the lambda that
+# minimises cross-validated error for a fitted cv.glmnet object.
+get_selected_features <- function(cv_fit, feature_names) {
+  best_col   <- which(cv_fit$cvm == min(cv_fit$cvm))
+  nonzero_ix <- which(cv_fit$glmnet.fit$beta[, best_col] != 0)
+  feature_names[nonzero_ix]
+}
+```
+
+```{r helper-stability-metrics, include=FALSE}
+# Returns the mean pairwise Jaccard index over a list of feature-selection sets.
+# Also returns the per-feature selection frequency across folds.
+#
+# `feat_list` – list of character vectors (one per fold)
+# `all_feats` – character vector of all possible feature names
+pairwise_jaccard <- function(feat_list) {
+  K      <- length(feat_list)
+  pairs  <- combn(K, 2)
+  scores <- numeric(ncol(pairs))
+  for (j in seq_len(ncol(pairs))) {
+    a <- feat_list[[ pairs[1, j] ]]
+    b <- feat_list[[ pairs[2, j] ]]
+    union_n <- length(union(a, b))
+    scores[j] <- if (union_n == 0) 0 else length(intersect(a, b)) / union_n
+  }
+  scores
+}
+
+selection_frequency <- function(feat_list, all_feats) {
+  freq <- table(factor(unlist(feat_list), levels = all_feats))
+  sort(as.numeric(freq) / length(feat_list), decreasing = TRUE) |>
+    setNames(names(sort(freq, decreasing = TRUE)))
+}
+```
+
+```{r helper-variability-metrics, include=FALSE}
+# Computes gene-level variability metrics across macrophage cluster means.
+#
+# For each gene: extract its per-cluster mean log-normalised expression from
+# the Seurat object, then compute:
+#   cv    = sd(cluster_means) / mean(cluster_means)   [scale-invariant]
+#   fano  = var(cluster_means) / mean(cluster_means)  [natural overdispersion]
+#
+# Both are computed on the per-cluster means, so they measure how much a
+# gene's average expression varies across the macrophage subtypes, not cell-
+# level noise within clusters.
+#
+# Returns a data frame with one row per gene.
+compute_cluster_variability <- function(srt, genes, cluster_col = "cell_label",
+                                        assay = "RNA") {
+  expr_mat <- as.matrix(
+    Seurat::GetAssayData(srt[genes, ], assay = assay, slot = "data")
+  )  # genes × cells
+  clusters <- srt[[cluster_col, drop = TRUE]]
+
+  # Per-cluster means: genes × clusters
+  cluster_means <- sapply(unique(clusters), function(cl) {
+    rowMeans(expr_mat[, clusters == cl, drop = FALSE])
+  })
+
+  # Metrics on the row (gene) vectors
+  gene_mean <- rowMeans(cluster_means)
+  gene_var  <- apply(cluster_means, 1, var)
+  gene_sd   <- apply(cluster_means, 1, sd)
+
+  # Guard against division by zero for genes with near-zero mean
+  cv   <- ifelse(gene_mean > 1e-6, gene_sd  / gene_mean, NA_real_)
+  fano <- ifelse(gene_mean > 1e-6, gene_var / gene_mean, NA_real_)
+
+  data.frame(
+    gene      = genes,
+    mean_expr = gene_mean,
+    cv        = cv,
+    fano      = fano,
+    row.names = NULL
+  )
+}
+```
+
+```{r helper-cluster-lfc, include=FALSE}
+# Computes per-cluster LFC (Old − Young) for each gene, then summarises
+# across clusters as mean and SD of LFC.
+#
+# The per-cluster LFC is: mean(log-norm expr, Old cells in cluster k)
+#                         - mean(log-norm expr, Young cells in cluster k)
+#
+# Mean LFC across clusters answers: does this gene go up/down in aging
+# overall (consistent with genome-wide DE)?
+#
+# SD of LFC across clusters answers: does the aging effect vary by
+# macrophage subtype? High SD = cluster-heterogeneous aging response,
+# which is precisely what DisTwiner's penalty is designed to capture
+# (genes whose co-expression neighbourhood diverges across at least one
+# cluster pair).
+#
+# Clusters where one condition is absent are silently dropped for that
+# gene, so n_clusters_used may be < total number of clusters.
+#
+# Returns a data frame with one row per gene.
+compute_cluster_lfc <- function(srt, genes,
+                                 cluster_col   = "cell_label",
+                                 condition_col = "Condition",
+                                 old_label     = "Old",
+                                 young_label   = "Young",
+                                 assay         = "RNA") {
+  expr_mat <- as.matrix(
+    Seurat::GetAssayData(srt[genes, ], assay = assay, slot = "data")
+  )  # genes × cells
+
+  clusters   <- srt[[cluster_col,   drop = TRUE]]
+  conditions <- srt[[condition_col, drop = TRUE]]
+
+  cl_levels <- unique(clusters)
+
+  # Per-cluster LFC matrix: genes × clusters (NA where a condition is absent)
+  lfc_mat <- sapply(cl_levels, function(cl) {
+    old_idx   <- clusters == cl & conditions == old_label
+    young_idx <- clusters == cl & conditions == young_label
+
+    if (sum(old_idx) == 0 || sum(young_idx) == 0) {
+      return(rep(NA_real_, length(genes)))
+    }
+    rowMeans(expr_mat[, old_idx,   drop = FALSE]) -
+    rowMeans(expr_mat[, young_idx, drop = FALSE])
+  })
+  # sapply returns genes × clusters when genes > 1; guard single-gene edge case
+  if (is.null(dim(lfc_mat))) lfc_mat <- matrix(lfc_mat, nrow = 1)
+  rownames(lfc_mat) <- genes
+  colnames(lfc_mat) <- cl_levels
+
+  data.frame(
+    gene             = genes,
+    mean_lfc         = rowMeans(lfc_mat,          na.rm = TRUE),
+    sd_lfc           = apply(lfc_mat, 1, sd,      na.rm = TRUE),
+    var_lfc          = apply(lfc_mat, 1, var,      na.rm = TRUE),
+    n_clusters_used  = apply(lfc_mat, 1, function(x) sum(!is.na(x))),
+    row.names        = NULL
+  )
+}
+```
+
+```{r helper-compute-de-lfc, include=FALSE}
+# Computes per-gene log2 fold-change (Old − Young) on a given set of cells.
+# This is the ranking statistic used for the DE+LR baseline. Running this
+# on training cells only inside each fold prevents data leakage.
+#
+# Returns a named numeric vector sorted descending by |LFC|.
+compute_lfc <- function(xdata_subset, ydata_subset) {
+  old_idx   <- ydata_subset == 1
+  young_idx <- ydata_subset == 0
+  if (sum(old_idx) == 0 || sum(young_idx) == 0) {
+    stop("Training fold has cells from only one condition.")
+  }
+  lfc <- colMeans(xdata_subset[old_idx,   , drop = FALSE]) -
+         colMeans(xdata_subset[young_idx, , drop = FALSE])
+  sort(lfc, decreasing = TRUE)
+}
+```
+
+```{r helper-mi, include=FALSE}
+# Discretises a continuous vector into Q equal-frequency (quantile) bins.
+# Zero-inflated scRNA-seq expression is handled naturally: zeros accumulate
+# in the lowest bin(s), which is informative rather than artefactual.
+discretize_quantile <- function(x, Q = params$mi_bins) {
+  breaks <- unique(quantile(x, probs = seq(0, 1, length.out = Q + 1),
+                            na.rm = TRUE))
+  if (length(breaks) < 3) return(rep(1L, length(x)))  # effectively constant
+  as.integer(cut(x, breaks = breaks, include.lowest = TRUE, labels = FALSE))
+}
+
+# Plug-in mutual information estimator I(X; Y) in bits (log2).
+# Positive bias for small samples, but consistent; acceptable here because we
+# are comparing methods on the same data, so relative differences are valid.
+compute_mi_plugin <- function(x_disc, y_labels) {
+  n          <- length(x_disc)
+  joint      <- table(x_disc, y_labels) / n
+  px         <- rowSums(joint)
+  py         <- colSums(joint)
+  outer_prod <- outer(px, py)
+  mi_terms   <- ifelse(joint > 0, joint * log2(joint / outer_prod), 0)
+  sum(mi_terms)
+}
+
+# Compute MI(gene expression; label) for a matrix of genes (rows = genes,
+# cols = cells).
+compute_gene_mi <- function(expr_mat, labels, Q = params$mi_bins) {
+  apply(expr_mat, 1, function(x) {
+    x_disc <- discretize_quantile(x, Q = Q)
+    compute_mi_plugin(x_disc, labels)
+  })
+}
+```
+
+```{r load data}
+mac_labels <- c("lateMacs", "repMacs", "intMacs",
+                "regMacs 1", "regMacs 2", "infMacs")
+
+srt <- readRDS(file.path(params$project_dir, "processed_data", "Seurat", paste0(params$dataset, ".rds"))) |>
+  subset(subset = cell_label %in% mac_labels)
+
+# Extract log-normalised expression matrix (cells × genes)
+xdata <- t(as.matrix(Seurat::GetAssayData(srt, assay = "RNA", slot = "data")))
+
+# Remove genes with zero variance across all cells
+xdata <- xdata[, apply(xdata, 2, sd) != 0]
+
+# Binary condition label: Young = 0, Old = 1
+ydata  <- as.integer(unname(srt$Condition) == "Old")
+ylabel <- as.character(unname(srt$cell_label))
+data   <- data.frame(xdata, y = ydata, label = ylabel)
+
+# 90 / 10 train-test split (fixed for all models)
+itrain <- sort(sample(nrow(xdata), floor(nrow(xdata) * 0.9)))
+itest  <- setdiff(seq_len(nrow(xdata)), itrain)
+```
+
+```{r plot data UMAP}
+srt <- seuPreProcess(srt)
+
+p_umap <- Seurat::DimPlot(srt, reduction = "umap_RNA", group.by = "cell_label")
+print(p_umap)
+
+ggsave(file.path(params$base_dir, "dimensionalityReduction", "UMAP.pdf"), p_umap)
+```
+
+```{r build correlation matrices}
+groups     <- unique(data[["label"]])
+group_list <- lapply(groups, function(g) {
+  data[data[["label"]] == g, !colnames(data) %in% c("y", "label")]
+})
+
+# Drop zero-variance genes within each group
+group_list <- lapply(group_list, function(mat) {
+  mat[, apply(mat, 2, sd) != 0, drop = FALSE]
+})
+
+# Retain only genes present in all groups and in the full xdata
+col_common <- Reduce(intersect, c(list(colnames(xdata)), lapply(group_list, colnames)))
+group_list <- lapply(group_list, function(x) x[, col_common, drop = FALSE])
+xdata      <- scale(xdata[, col_common])
+
+# Scale within each group before computing correlations
+group_list <- lapply(group_list, scale)
+
+group_cor <- lapply(group_list, function(x) {
+  propagate::bigcor(x, y = NULL, fun = "cor", size = 2000, verbose = FALSE)
+}) |>
+  lapply(function(x) as.data.frame(ff::as.ffdf(x))) |>
+  lapply(function(x) mutate(x, across(everything(), \(v) replace_na(v, 0))))
+
+n_feats <- ncol(xdata)
+```
+
+```{r distwiner-model}
+model <- "distwiner"
+
+# --- Weight computation ---
+linear_dissim <- function(raw) 1 - acos(raw)/pi
+
+ang_weight <- compute_twiner_weights(
+  group_cor    = group_cor,
+  n_feats      = n_feats,
+  transform_fn = function(r) exp(linear_dissim(r)),
+  aggregate_fn = function(x) {
+    pos <- x[x > 0]
+    if (length(pos) == 0) 0 else min(pos)
+  }
+)
+
+# Weight distribution
+p_weights <- ggplot(data.frame(weight = ang_weight), aes(x = weight)) +
+  geom_histogram(binwidth = 0.01, fill = "#69b3a2", color = "#e9ecef", alpha = 0.9) +
+  theme_minimal() +
+  theme(
+    axis.title  = element_text(size = 15),
+    axis.text   = element_text(size = 12)
+  ) +
+  xlab("Feature weight") + ylab("Count")
+
+ggsave(file.path(params$base_dir, "featureWeight", paste0(model, ".pdf")),
+       p_weights, width = 9)
+
+# Free large intermediate objects before model fitting
+rm(group_cor, group_list)
+gc()
+
+# --- Fit penalised elastic net ---
+fit_distwiner <- glmnet::cv.glmnet(
+  xdata[itrain, ], as.factor(ydata[itrain]),
+  family         = "binomial",
+  nfolds         = 10,
+  alpha          = 0.9,
+  penalty.factor = ang_weight,
+  type.measure   = "mse"
+)
+saveRDS(fit_distwiner,
+        file.path(params$base_dir, "trainedModels", paste0(model, ".rds")))
+
+# --- Predictions ---
+ypred_class <- as.integer(
+  predict(fit_distwiner, newx = xdata[itest, ], type = "class")
+)
+yprob_pos <- predict(
+  fit_distwiner, newx = xdata[itest, ], type = "response"
+)[, 1]
+
+evaluate_model(model, ypred_class, yprob_pos, ydata[itest], params$base_dir)
+
+# --- Selected features ---
+var_selected_distwiner <- get_selected_features(fit_distwiner, colnames(xdata))
+saveRDS(var_selected_distwiner,
+        file.path(params$base_dir, "selectedFeatures", paste0(model, ".rds")))
+```
+
+```{r random-forest-model}
+model <- "randomForest"
+
+xtrain <- xdata[itrain, ]
+xtest  <- xdata[itest, ]
+ytrain <- as.factor(ydata[itrain])
+ytest  <- as.factor(ydata[itest])
+
+rf <- randomForest::randomForest(
+  x = xtrain, y = ytrain,
+  xtest = xtest, ytest = ytest
+)
+saveRDS(rf, file.path(params$base_dir, "trainedModels", paste0(model, ".rds")))
+
+ypred_class <- as.integer(as.character(rf$test$predicted))
+yprob_pos   <- rf$test$votes[, 2]
+
+evaluate_model(model, ypred_class, yprob_pos, ydata[itest], params$base_dir)
+```
+
+```{r svm-model}
+model <- "svm"
+
+feat_col <- which(!colnames(data) %in% c("y", "label"))
+dataset  <- data.frame(xdata, ydata = factor(ydata, levels = c(0, 1)))
+y_col    <- which(colnames(dataset) == "ydata")
+
+# Note: xdata is already scaled — no additional scaling applied here
+training_set <- dataset[itrain, ]
+test_set     <- dataset[itest, ]
+
+classifier <- e1071::svm(
+  formula     = ydata ~ .,
+  data        = training_set,
+  type        = "C-classification",
+  kernel      = "linear",
+  probability = TRUE          # required for predict(..., probability = TRUE)
+)
+saveRDS(classifier,
+        file.path(params$base_dir, "trainedModels", paste0(model, ".rds")))
+
+ypred_raw   <- predict(classifier, newdata = test_set[, -y_col],
+                       probability = TRUE)
+ypred_class <- as.integer(as.character(ypred_raw))
+yprob_pos   <- attr(ypred_raw, "probabilities")[, "1"]
+
+evaluate_model(model, ypred_class, yprob_pos, ydata[itest], params$base_dir)
+```
+
+```{r elastic-net-model}
+model <- "elasticNet"
+
+fit_en <- glmnet::cv.glmnet(
+  xdata[itrain, ], as.factor(ydata[itrain]),
+  family       = "binomial",
+  nfolds       = 10,
+  alpha        = 0.9,
+  type.measure = "mse"
+)
+saveRDS(fit_en, file.path(params$base_dir, "trainedModels", paste0(model, ".rds")))
+
+ypred_class <- as.integer(
+  predict(fit_en, newx = xdata[itest, ], type = "class")
+)
+yprob_pos <- predict(fit_en, newx = xdata[itest, ], type = "response")[, 1]
+
+evaluate_model(model, ypred_class, yprob_pos, ydata[itest], params$base_dir)
+
+var_selected_en <- get_selected_features(fit_en, colnames(xdata))
+saveRDS(var_selected_en,
+        file.path(params$base_dir, "selectedFeatures", paste0(model, ".rds")))
+```
+
+```{r feature-comparison}
+# Load from disk so this chunk is self-contained when re-run independently
+fit_distwiner <- readRDS(file.path(params$base_dir, "trainedModels", "distwiner.rds"))
+fit_en        <- readRDS(file.path(params$base_dir, "trainedModels", "elasticNet.rds"))
+
+sel_dt <- get_selected_features(fit_distwiner, colnames(xdata))
+sel_en <- get_selected_features(fit_en,        colnames(xdata))
+
+df_scatter <- data.frame(
+  weight = ang_weight,
+  idx    = seq_along(ang_weight),
+  class  = dplyr::case_when(
+    colnames(xdata) %in% sel_dt & colnames(xdata) %in% sel_en ~ "Both",
+    colnames(xdata) %in% sel_dt                                ~ "DisTwiner only",
+    colnames(xdata) %in% sel_en                                ~ "Elastic Net only",
+    TRUE                                                        ~ "Neither"
+  )
+)
+
+CLASS_COLOURS <- c(
+  "Both"             = "purple",
+  "DisTwiner only"   = "red",
+  "Elastic Net only" = "blue",
+  "Neither"          = "grey80"
+)
+
+# Scatter: weight by feature index, coloured by selection class
+p_scatter <- ggplot(df_scatter, aes(x = idx, y = weight, colour = class)) +
+  geom_point(size = 0.6, alpha = 0.5) +
+  geom_point(data = filter(df_scatter, class != "Neither"),
+             size = 2, alpha = 0.9) +
+  scale_colour_manual(values = CLASS_COLOURS) +
+  theme_minimal() +
+  labs(x = "Feature index", y = "DisTwiner weight", colour = NULL)
+
+ggsave(file.path(params$base_dir, "selectedFeatures", "disTwinerVSelasticNet.pdf"),
+       p_scatter)
+print(p_scatter)
+
+# Density histogram of weights, stratified by selection class
+p_hist <- ggplot(df_scatter,
+                 aes(x = weight, fill = class, y = after_stat(density))) +
+  geom_histogram(colour = "#e9ecef", alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = CLASS_COLOURS) +
+  theme_minimal() +
+  labs(x = "DisTwiner weight", y = "Density", fill = NULL)
+
+ggsave(file.path(params$base_dir, "selectedFeatures", "disTwinerVSelasticNet_histogram.pdf"),
+       p_hist)
+print(p_hist)
+```
+
+```{r feature-stability-analysis}
+K <- params$n_stability_folds
+
+sel_distwiner_folds <- vector("list", K)
+sel_en_folds        <- vector("list", K)
+
+for (fold in seq_len(K)) {
+  set.seed(params$seed + fold)   # different split each fold, reproducible
+  idx_train <- sort(sample(nrow(xdata), floor(nrow(xdata) * 0.9)))
+
+  # --- DisTwiner (penalised elastic net, weights fixed from full itrain) ---
+  fit_dt_fold <- glmnet::cv.glmnet(
+    xdata[idx_train, ], as.factor(ydata[idx_train]),
+    family         = "binomial",
+    nfolds         = 5,           # inner CV; 5 keeps runtime manageable
+    alpha          = 0.9,
+    penalty.factor = ang_weight,
+    type.measure   = "mse"
+  )
+  sel_distwiner_folds[[fold]] <- get_selected_features(fit_dt_fold, colnames(xdata))
+
+  # --- Elastic Net (no penalisation) ---
+  fit_en_fold <- glmnet::cv.glmnet(
+    xdata[idx_train, ], as.factor(ydata[idx_train]),
+    family       = "binomial",
+    nfolds       = 5,
+    alpha        = 0.9,
+    type.measure = "mse"
+  )
+  sel_en_folds[[fold]] <- get_selected_features(fit_en_fold, colnames(xdata))
+
+  cat(sprintf(
+    "Fold %2d/%d | DisTwiner: %d features | Elastic Net: %d features\n",
+    fold, K,
+    length(sel_distwiner_folds[[fold]]),
+    length(sel_en_folds[[fold]])
+  ))
+}
+
+saveRDS(sel_distwiner_folds,
+        file.path(params$base_dir, "stability", "distwiner_fold_features.rds"))
+saveRDS(sel_en_folds,
+        file.path(params$base_dir, "stability", "elasticNet_fold_features.rds"))
+```
+
+```{r stability-jaccard}
+jacc_dt <- pairwise_jaccard(sel_distwiner_folds)
+jacc_en <- pairwise_jaccard(sel_en_folds)
+
+df_jaccard <- data.frame(
+  jaccard = c(jacc_dt, jacc_en),
+  model   = rep(c("DisTwiner", "Elastic Net"),
+                c(length(jacc_dt), length(jacc_en)))
+)
+
+cat(sprintf(
+  "Mean pairwise Jaccard — DisTwiner: %.3f (SD: %.3f) | Elastic Net: %.3f (SD: %.3f)\n",
+  mean(jacc_dt), sd(jacc_dt), mean(jacc_en), sd(jacc_en)
+))
+
+# Wilcoxon test: is DisTwiner's Jaccard distribution shifted higher?
+wt <- wilcox.test(jacc_dt, jacc_en, alternative = "greater")
+cat(sprintf("Wilcoxon test (DisTwiner > Elastic Net): W = %.0f, p = %.4f\n",
+            wt$statistic, wt$p.value))
+
+p_jaccard <- ggplot(df_jaccard, aes(x = model, y = jaccard, fill = model)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+  scale_fill_manual(values = c("DisTwiner" = "#69b3a2", "Elastic Net" = "#F7AD50")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text  = element_text(size = 13),
+        axis.title = element_text(size = 14)) +
+  labs(
+    x = NULL,
+    y = "Pairwise Jaccard index",
+    title = sprintf(
+      "Feature selection stability across %d re-sampling folds\np = %.4f (Wilcoxon, DisTwiner > Elastic Net)",
+      K, wt$p.value
+    )
+  )
+
+ggsave(file.path(params$base_dir, "stability", "pairwise_jaccard_violin.pdf"),
+       p_jaccard, width = 6, height = 5)
+print(p_jaccard)
+```
+
+```{r stability-selection-frequency}
+all_feats <- colnames(xdata)
+
+freq_dt <- selection_frequency(sel_distwiner_folds, all_feats)
+freq_en <- selection_frequency(sel_en_folds,        all_feats)
+
+# Top-N consistently selected features (selected in >50% of folds)
+top_dt <- names(freq_dt[freq_dt > 0.5])
+top_en <- names(freq_en[freq_en > 0.5])
+
+cat(sprintf("DisTwiner: %d features selected in >50%% of folds\n",  length(top_dt)))
+cat(sprintf("Elastic Net: %d features selected in >50%% of folds\n", length(top_en)))
+
+# Frequency distribution
+df_freq <- data.frame(
+  frequency = c(freq_dt[freq_dt > 0], freq_en[freq_en > 0]),
+  model     = c(rep("DisTwiner",  sum(freq_dt > 0)),
+                rep("Elastic Net", sum(freq_en > 0)))
+)
+
+p_freq <- ggplot(df_freq, aes(x = frequency, fill = model)) +
+  geom_histogram(binwidth = 0.05, colour = "white", alpha = 0.7,
+                 position = "identity") +
+  scale_fill_manual(values = c("DisTwiner" = "#69b3a2", "Elastic Net" = "#F7AD50")) +
+  facet_wrap(~ model, ncol = 1, scales = "free_y") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 13),
+        axis.text  = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.position = "none") +
+  labs(
+    x = "Selection frequency (fraction of folds)",
+    y = "Number of features",
+    title = "Feature selection frequency distribution"
+  )
+
+ggsave(file.path(params$base_dir, "stability", "selection_frequency_histogram.pdf"),
+       p_freq, width = 7, height = 6)
+print(p_freq)
+
+# Save consistently selected feature lists
+saveRDS(top_dt, file.path(params$base_dir, "stability", "distwiner_stable_features.rds"))
+saveRDS(top_en, file.path(params$base_dir, "stability", "elasticNet_stable_features.rds"))
+```
+
+```{r stability-overlap-heatmap}
+# Visualise per-fold selection as a binary heatmap for the union of
+# consistently selected features (selected in ≥50% of folds by either model).
+top_union <- union(top_dt, top_en)
+
+make_fold_matrix <- function(feat_list, features) {
+  mat <- matrix(0L, nrow = length(feat_list), ncol = length(features),
+                dimnames = list(paste0("Fold ", seq_along(feat_list)), features))
+  for (f in seq_along(feat_list)) {
+    mat[f, intersect(feat_list[[f]], features)] <- 1L
+  }
+  mat
+}
+
+mat_dt <- make_fold_matrix(sel_distwiner_folds, top_union)
+mat_en <- make_fold_matrix(sel_en_folds,        top_union)
+
+# Sort features by DisTwiner selection frequency for a cleaner visual
+feat_order <- names(sort(colSums(mat_dt), decreasing = TRUE))
+
+df_heatmap <- rbind(
+  reshape2::melt(mat_dt[, feat_order],
+                 varnames = c("Fold", "Feature"), value.name = "Selected") |>
+    mutate(Model = "DisTwiner"),
+  reshape2::melt(mat_en[, feat_order],
+                 varnames = c("Fold", "Feature"), value.name = "Selected") |>
+    mutate(Model = "Elastic Net")
+)
+
+p_heatmap <- ggplot(df_heatmap,
+                    aes(x = Feature, y = Fold, fill = factor(Selected))) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = c("0" = "grey93", "1" = "#2c7bb6"),
+                    labels  = c("Not selected", "Selected")) +
+  facet_wrap(~ Model, ncol = 1) +
+  theme_minimal() +
+  theme(
+    axis.text.x  = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7),
+    axis.text.y  = element_text(size = 9),
+    strip.text   = element_text(size = 13),
+    legend.title = element_blank()
+  ) +
+  labs(x = NULL, y = NULL,
+       title = "Per-fold selection of consistently selected features")
+
+ggsave(file.path(params$base_dir, "stability", "selection_heatmap.pdf"),
+       p_heatmap, width = max(10, length(top_union) * 0.4), height = 8, limitsize = FALSE)
+print(p_heatmap)
+```
+
+# Cross-cluster feature expression variability
+
+```{r variability-compute}
+# Union of all genes evaluated (selected by any method + a random background)
+# Background: 2000 randomly sampled unselected genes for context
+set.seed(params$seed)
+all_selected   <- union(sel_dt, sel_en)
+background     <- sample(
+  setdiff(colnames(xdata), all_selected), size = 2000
+)
+genes_to_eval  <- union(all_selected, background)
+genes_to_eval  <- intersect(genes_to_eval, rownames(srt))  # safety check
+
+cat(sprintf(
+  "Evaluating variability for %d genes (%d DisTwiner, %d EN, %d background)\n",
+  length(genes_to_eval),
+  length(intersect(genes_to_eval, sel_dt)),
+  length(intersect(genes_to_eval, sel_en)),
+  length(intersect(genes_to_eval, background))
+))
+
+# Compute variability on log-normalised (unscaled) expression
+var_df <- compute_cluster_variability(srt, genes_to_eval, cluster_col = "cell_label")
+
+# Annotate by selection class (a gene can belong to multiple classes)
+var_df <- var_df |>
+  mutate(
+    in_disTwiner = gene %in% sel_dt,
+    in_en        = gene %in% sel_en,
+    selection    = case_when(
+      in_disTwiner & in_en  ~ "Both",
+      in_disTwiner          ~ "DisTwiner only",
+      in_en                 ~ "Elastic Net only",
+      TRUE                  ~ "Background"
+    )
+  )
+
+saveRDS(var_df, file.path(params$base_dir, "variability", "cluster_variability.rds"))
+```
+
+```{r variability-plot}
+# Colour palette consistent with Stage 2 / Stage 3 documents
+VAR_COLOURS <- c(
+  "Both"             = "purple",
+  "DisTwiner only"   = "#2c7bb6",
+  "Elastic Net only" = "#d7191c",
+  "Background"       = "grey70"
+)
+
+# CV violin plot
+p_cv <- ggplot(var_df, aes(x = selection, y = cv, fill = selection)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.9, fill = "white") +
+  scale_fill_manual(values = VAR_COLOURS) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text  = element_text(size = 12),
+        axis.title = element_text(size = 13)) +
+  labs(x = NULL, y = "CV of per-cluster mean expression",
+       title = "Cross-cluster expression variability (CV)")
+
+# Fano factor violin plot
+p_fano <- ggplot(var_df, aes(x = selection, y = fano, fill = selection)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.9, fill = "white") +
+  scale_fill_manual(values = VAR_COLOURS) +
+  scale_y_log10() +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text  = element_text(size = 12),
+        axis.title = element_text(size = 13)) +
+  labs(x = NULL, y = "Fano factor of per-cluster mean expression (log10)",
+       title = "Cross-cluster expression variability (Fano)")
+
+ggsave(file.path(params$base_dir, "variability", "cv_violin.pdf"),    p_cv,   width = 7, height = 5)
+ggsave(file.path(params$base_dir, "variability", "fano_violin.pdf"),  p_fano, width = 7, height = 5)
+print(p_cv)
+print(p_fano)
+```
+
+```{r variability-cluster-lfc-compute}
+lfc_df <- compute_cluster_lfc(srt, genes_to_eval, cluster_col = "cell_label")
+
+lfc_df <- lfc_df |>
+  mutate(
+    in_disTwiner = gene %in% sel_dt,
+    in_en        = gene %in% sel_en,
+    selection    = case_when(
+      in_disTwiner & in_en  ~ "Both",
+      in_disTwiner          ~ "DisTwiner only",
+      in_en                 ~ "Elastic Net only",
+      TRUE                  ~ "Background"
+    )
+  )
+
+# Merge with selection annotations already built in var_df
+lfc_df <- lfc_df |>
+  left_join(dplyr::select(var_df, gene, mean_expr, cv, fano), by = "gene")
+
+saveRDS(lfc_df, file.path(params$base_dir, "variability", "cluster_lfc.rds"))
+
+cat(sprintf(
+  "Clusters used per gene — min: %d, median: %.0f, max: %d\n",
+  min(lfc_df$n_clusters_used),
+  median(lfc_df$n_clusters_used),
+  max(lfc_df$n_clusters_used)
+))
+```
+
+```{r variability-cluster-lfc-plot}
+# ── Mean LFC across clusters ────────────────────────────────────────────────
+# Centred near zero for most genes; large |mean| = consistent directional
+# aging response across all subtypes.
+p_mean_lfc <- ggplot(lfc_df, aes(x = selection, y = mean_lfc, fill = selection)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", alpha = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = VAR_COLOURS) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text  = element_text(size = 12),
+        axis.title = element_text(size = 13)) +
+  labs(
+    x     = NULL,
+    y     = "Mean LFC (Old − Young) across clusters",
+    title = "Mean per-cluster aging LFC by feature selection class"
+  )
+
+# ── SD of LFC across clusters ───────────────────────────────────────────────
+# High SD = aging effect is cluster-heterogeneous. DisTwiner selects genes
+# where co-expression structure diverges across at least one cluster pair,
+# so we expect DisTwiner-only genes to show higher SD than EN-only or
+# background genes.
+p_sd_lfc <- ggplot(lfc_df, aes(x = selection, y = sd_lfc, fill = selection)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", alpha = 0.9) +
+  scale_fill_manual(values = VAR_COLOURS) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text  = element_text(size = 12),
+        axis.title = element_text(size = 13)) +
+  labs(
+    x     = NULL,
+    y     = "SD of per-cluster LFC (Old − Young)",
+    title = "Cluster-heterogeneity of aging LFC by feature selection class"
+  )
+
+# ── Scatter: mean LFC vs SD LFC ─────────────────────────────────────────────
+# Quadrant interpretation:
+#   top-right:    large consistent aging response AND heterogeneous across clusters
+#   top-left:     heterogeneous but no overall direction
+#   bottom-right: consistent direction, uniform across clusters
+#   bottom-left:  no meaningful aging signal
+p_scatter_lfc <- ggplot(
+  lfc_df,
+  aes(x = abs(mean_lfc), y = sd_lfc, colour = selection, alpha = selection)
+) +
+  geom_point(size = 0.9) +
+  scale_colour_manual(values = VAR_COLOURS) +
+  scale_alpha_manual(values = c(
+    "Both"             = 0.9,
+    "DisTwiner only"   = 0.85,
+    "Elastic Net only" = 0.85,
+    "Background"       = 0.15
+  )) +
+  theme_minimal() +
+  theme(axis.text  = element_text(size = 11),
+        axis.title = element_text(size = 12)) +
+  labs(
+    x      = "|Mean LFC| across clusters",
+    y      = "SD of LFC across clusters",
+    colour = NULL, alpha  = NULL,
+    title  = "Consistency vs cluster-heterogeneity of aging LFC"
+  ) +
+  guides(alpha = "none")
+
+ggsave(file.path(params$base_dir, "variability", "mean_lfc_violin.pdf"),
+       p_mean_lfc,    width = 7, height = 5)
+ggsave(file.path(params$base_dir, "variability", "sd_lfc_violin.pdf"),
+       p_sd_lfc,      width = 7, height = 5)
+ggsave(file.path(params$base_dir, "variability", "lfc_mean_vs_sd_scatter.pdf"),
+       p_scatter_lfc, width = 8, height = 6)
+
+print(p_mean_lfc)
+print(p_sd_lfc)
+print(p_scatter_lfc)
+```
+
+```{r variability-stats}
+# Pairwise Wilcoxon tests between selection classes for each metric.
+# Comparisons of interest: DisTwiner only vs EN only, and each vs Background.
+comparison_pairs <- list(
+  c("DisTwiner only", "Elastic Net only"),
+  c("DisTwiner only", "Background"),
+  c("Elastic Net only", "Background")
+)
+
+run_wilcoxon_pairs <- function(df, metric_col) {
+  purrr::map_dfr(comparison_pairs, function(pair) {
+    x <- df[[metric_col]][df$selection == pair[1]]
+    y <- df[[metric_col]][df$selection == pair[2]]
+    x <- x[is.finite(x)]
+    y <- y[is.finite(y)]
+    wt <- wilcox.test(x, y, alternative = "two.sided", exact = FALSE)
+    data.frame(
+      metric    = metric_col,
+      group1    = pair[1],
+      group2    = pair[2],
+      n1        = length(x),
+      n2        = length(y),
+      median1   = median(x),
+      median2   = median(y),
+      W         = wt$statistic,
+      p_value   = wt$p.value,
+      p_adj_BH  = NA_real_   # filled after all tests collected
+    )
+  })
+}
+
+wilcox_results <- bind_rows(
+  run_wilcoxon_pairs(var_df, "cv"),
+  run_wilcoxon_pairs(var_df, "fano")
+)
+wilcox_results$p_adj_BH <- p.adjust(wilcox_results$p_value, method = "BH")
+
+print(wilcox_results)
+saveRDS(wilcox_results,
+        file.path(params$base_dir, "variability", "wilcoxon_results.rds"))
+```
+
+```{r variability-cluster-lfc-stats}
+# Pairwise Wilcoxon tests for mean_lfc and sd_lfc, appended to the existing
+# wilcox_results table from the CV/Fano analysis so everything is in one place.
+wilcox_lfc <- bind_rows(
+  run_wilcoxon_pairs(lfc_df, "mean_lfc"),
+  run_wilcoxon_pairs(lfc_df, "sd_lfc")
+)
+
+# BH correction jointly across all variability tests (CV, Fano, mean_lfc, sd_lfc)
+wilcox_variability_all <- bind_rows(wilcox_results, wilcox_lfc)
+wilcox_variability_all$p_adj_BH <- p.adjust(
+  wilcox_variability_all$p_value, method = "BH"
+)
+wilcox_variability_all$significant <- wilcox_variability_all$p_adj_BH < params$padj_threshold
+
+print(wilcox_variability_all)
+saveRDS(wilcox_variability_all,
+        file.path(params$base_dir, "variability", "wilcoxon_all_variability_metrics.rds"))
+```
+
+# Entropy analysis
+
+```{r entropy-compute}
+# Genes to evaluate: union of DisTwiner and EN selected sets + background
+genes_mi   <- intersect(genes_to_eval, colnames(xdata))
+expr_genes <- t(as.matrix(
+  Seurat::GetAssayData(srt[genes_mi, ], assay = "RNA", slot = "data")
+))  # cells × genes
+
+cluster_labels   <- as.character(srt$cell_label)
+condition_labels <- as.character(srt$Condition)
+
+cat(sprintf("Computing MI for %d genes...\n", length(genes_mi)))
+
+# These are the most expensive calls in this document.
+# Each applies discretise + plug-in estimator per gene.
+mi_cluster   <- compute_gene_mi(t(expr_genes), cluster_labels,
+                                Q = params$mi_bins)
+mi_condition <- compute_gene_mi(t(expr_genes), condition_labels,
+                                Q = params$mi_bins)
+
+mi_df <- data.frame(
+  gene         = genes_mi,
+  mi_cluster   = mi_cluster,
+  mi_condition = mi_condition,
+  row.names    = NULL
+) |>
+  mutate(
+    in_disTwiner = gene %in% sel_dt,
+    in_en        = gene %in% sel_en,
+    selection    = case_when(
+      in_disTwiner & in_en  ~ "Both",
+      in_disTwiner          ~ "DisTwiner only",
+      in_en                 ~ "Elastic Net only",
+      TRUE                  ~ "Background"
+    )
+  )
+
+saveRDS(mi_df, file.path(params$base_dir, "entropy", "mutual_information.rds"))
+cat("Done.\n")
+```
+
+```{r entropy-cluster-specificity-plot}
+# MI with cluster label: does DisTwiner select more cluster-specific genes?
+p_mi_cluster <- ggplot(mi_df, aes(x = selection, y = mi_cluster, fill = selection)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", alpha = 0.9) +
+  scale_fill_manual(values = c("DisTwiner only" = "#69b3a2", "Elastic Net only" = "#F7AD50", "Background" = "red", "Both" = "yellow")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text  = element_text(size = 12),
+        axis.title = element_text(size = 13)) +
+  labs(x = NULL,
+       y = "MI (gene expression; cluster label) [bits]",
+       title = "Cluster-specificity of selected features")
+
+ggsave(file.path(params$base_dir, "entropy", "mi_cluster_violin.pdf"),
+       p_mi_cluster, width = 7, height = 5)
+print(p_mi_cluster)
+```
+
+```{r entropy-condition-specificity-plot}
+# MI with condition label: does DisTwiner select more condition-informative genes?
+p_mi_cond <- ggplot(mi_df, aes(x = selection, y = mi_condition, fill = selection)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", alpha = 0.9) +
+  scale_fill_manual(values = c("DisTwiner only" = "#69b3a2", "Elastic Net only" = "#F7AD50", "Background" = "red", "Both" = "yellow")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text  = element_text(size = 12),
+        axis.title = element_text(size = 13)) +
+  labs(x = NULL,
+       y = "MI (gene expression; condition label) [bits]",
+       title = "Condition-specificity of selected features")
+
+ggsave(file.path(params$base_dir, "entropy", "mi_condition_violin.pdf"),
+       p_mi_cond, width = 7, height = 5)
+print(p_mi_cond)
+```
+
+```{r entropy-scatter-cluster-vs-condition}
+# Joint scatter: MI_cluster vs MI_condition, coloured by selection class.
+# Ideally, a method selecting good classifiers should sit in the upper-left
+# region: high condition-MI (informative for Old/Young) but lower cluster-MI
+# (not confounded by subtype membership).
+p_scatter_mi <- ggplot(mi_df, aes(x = mi_cluster, y = mi_condition,
+                                   colour = selection, alpha = selection)) +
+  geom_point(size = 0.8) +
+  scale_colour_manual(values = c("DisTwiner only" = "#69b3a2", "Elastic Net only" = "#F7AD50", "Background" = "red", "Both" = "yellow")) +
+  scale_alpha_manual(values = c(
+    "Both" = 0.9, "DisTwiner only" = 0.8,
+    "Elastic Net only" = 0.8, "Background" = 0.2
+  )) +
+  theme_minimal() +
+  theme(axis.text  = element_text(size = 11),
+        axis.title = element_text(size = 12)) +
+  labs(
+    x      = "MI (gene; cluster) [bits]",
+    y      = "MI (gene; condition) [bits]",
+    colour = NULL, alpha = NULL,
+    title  = "Cluster-specificity vs condition-specificity of selected features"
+  ) +
+  guides(alpha = "none")
+
+ggsave(file.path(params$base_dir, "entropy", "mi_scatter_cluster_vs_condition.pdf"),
+       p_scatter_mi, width = 8, height = 6)
+print(p_scatter_mi)
+```
+
+```{r entropy-stats}
+# Wilcoxon comparisons for both MI metrics, same pairs as Analysis 1.
+wilcox_mi <- bind_rows(
+  run_wilcoxon_pairs(mi_df, "mi_cluster"),
+  run_wilcoxon_pairs(mi_df, "mi_condition")
+)
+wilcox_mi$p_adj_BH <- p.adjust(wilcox_mi$p_value, method = "BH")
+print(wilcox_mi)
+
+saveRDS(wilcox_mi, file.path(params$base_dir, "entropy", "wilcoxon_mi.rds"))
+```
