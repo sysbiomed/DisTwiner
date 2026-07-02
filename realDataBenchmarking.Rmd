@@ -1204,3 +1204,27 @@ print(wilcox_mi)
 
 saveRDS(wilcox_mi, file.path(params$base_dir, "entropy", "wilcoxon_mi.rds"))
 ```
+
+```{r}
+fit_distwiner <- readRDS(file.path(params$base_dir, "trainedModels", "distwiner.rds"))
+sel_dt <- get_selected_features(fit_distwiner, colnames(xdata))
+
+macs_lfc <- matrix(0, ncol = length(mac_labels), nrow = length(sel_dt))
+macs_lfc <- data.frame(macs_lfc, row.names = sel_dt)
+colnames(macs_lfc) <- mac_labels
+
+for (i in mac_labels) {
+  srt_temp <- srt %>% subset(subset = cell_label == i)
+  Idents(srt_temp) <- "Condition"
+  lfc <- Seurat::FoldChange(srt_temp, 
+                            ident.1 = "Old", 
+                            ident.2 = "Young", 
+                            features = sel_dt)
+  macs_lfc[,i] <- lfc$avg_log2FC
+}
+
+macs_lfc$gene <- rownames(macs_lfc)
+
+writexl::write_xlsx(macs_lfc, path = file.path(params$base_dir, "selectedFeatures", "distwiner_macs_lfc.xlsx"), col_names = TRUE)
+```
+
